@@ -81,6 +81,7 @@ def build_benchmark_command(scenario: dict, config: dict, is_last_run: bool = Fa
     tensor_parallel_size = config.get('model', {}).get('tensor_parallel_size', 8)
     max_num_batched_tokens = config['serve']['max_num_batched_tokens']
     max_num_seqs = config['serve']['max_num_seqs']
+    extra_args = config.get('serve', {}).get('extra_args', '') or ''
 
     input_len = scenario.get('input_len', 1024)
     output_len = scenario.get('output_len', 1024)
@@ -121,6 +122,9 @@ def build_benchmark_command(scenario: dict, config: dict, is_last_run: bool = Fa
             str(max_num_seqs),
             '--enforce-eager',
         ]
+        if extra_args:
+            import shlex
+            cmd += shlex.split(extra_args)
         if is_last_run:
             profiler_config = {
                 "profiler": "torch",
