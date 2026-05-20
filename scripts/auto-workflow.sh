@@ -18,6 +18,7 @@
 #   ./auto-workflow.sh --model qwen-3.5 --scenario shape --gems-mode mm --pretune
 #   ./auto-workflow.sh --model qwen-3.5 --runs 5
 #   ./auto-workflow.sh --model qwen-3.5 --all
+#   ./auto-workflow.sh --model qwen-3.5 --serve
 #
 # 参数:
 #   --model NAME          使用 config.yaml.NAME 作为配置文件
@@ -30,6 +31,7 @@
 #   --pretune             透传给 run-workflow.sh，输出目录追加 pretune 后缀
 #   --runs N              透传给 run-workflow.sh 的 --runs（覆盖 benchmark.num_runs）
 #   --all                 依次运行 shape → optimized → nsys
+#   --serve               仅启动服务器并发送一条测试请求验证可用性
 #   --device N            GPU 设备 ID (默认 0)
 #
 
@@ -110,6 +112,10 @@ parse_args() {
                 ;;
             --all)
                 WORKFLOW_MODE="all"
+                shift
+                ;;
+            --serve)
+                WORKFLOW_MODE="serve"
                 shift
                 ;;
             -h|--help)
@@ -267,6 +273,60 @@ run_torch() {
     log_info "Torch Profiling 模式完成"
 }
 
+# 启动服务器并验证
+run_serve() {
+    log_section "启动服务器并验证"
+
+    local base_args
+    base_args=$(build_base_args)
+
+    local mode_args=""
+    case "$TARGET_MODE" in
+        gems)
+            mode_args="--mode gems --gems-mode $GEMS_MODE --gems-once $GEMS_ONCE"
+            log_step "启动 vllm server (gems, gems-mode=$GEMS_MODE)"
+            ;;
+        all)
+            if [[ "$GEMS_MODE" != "all" ]]; then
+                mode_args="--mode gems --gems-mode $GEMS_MODE --gems-once $GEMS_ONCE"
+                log_step "启动 vllm server (gems, gems-mode=$GEMS_MODE)"
+            else
+                log_warn "--serve 模式不支持 --mode all，降级为 cuda"
+                mode_args="--mode cuda"
+                log_step "启动 vllm server (cuda)"
+            fi
+            ;;
+        *)
+            mode_args="--mode cuda"
+            log_step "启动 vllm server (cuda)"
+            ;;
+    esac
+
+    "${SCRIPT_DIR}/run-workflow.sh" $mode_args $base_args --scenario optimized --run-idle
+
+    # 从 config 读取端口和模型名
+    local config_file="${PROJECT_ROOT}/config.yaml.${MODEL_CONFIG}"
+    local port_base model_name
+    port_base=$(yq '.benchmark.port_base' "$config_file")
+    model_name=$(yq '.model.name' "$config_file")
+    local port=$((port_base + DEVICE))
+
+    log_step "发送测试请求..."
+    local response
+    response=$(curl -s "http://localhost:${port}/v1/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "{\"model\":\"${model_name}\",\"messages\":[{\"role\":\"user\",\"content\":\"中国的首都是哪里\"}],\"max_tokens\":128}")
+
+    echo ""
+    log_info "模型回复:"
+    echo "$response" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin), indent=4, ensure_ascii=False))" 2>/dev/null || echo "$response"
+
+    echo ""
+    log_info "服务器保持运行中，端口: ${port}"
+    log_info "连接 tmux: tmux attach -t flagtune"
+    log_info "手动测试: curl http://localhost:${port}/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"${model_name}\",\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}],\"max_tokens\":128}'"
+}
+
 # 运行所有模式
 run_all() {
     log_section "运行所有模式 (shape → optimized → nsys)"
@@ -316,6 +376,9 @@ main() {
             ;;
         torch)
             run_torch
+            ;;
+        serve)
+            run_serve
             ;;
         all)
             run_all
