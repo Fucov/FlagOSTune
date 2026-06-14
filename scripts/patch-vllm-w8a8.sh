@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# patch-vllm-fp8.sh - 对 vLLM 进行动态补丁，使线性层使用 Triton FP8 kernel
+# patch-vllm-w8a8.sh - 对 vLLM 进行动态补丁，使线性层使用 FlagGems W8A8 kernel
 #
 # 补丁点:
 #   vllm/model_executor/layers/quantization/utils/fp8_utils.py
@@ -18,9 +18,9 @@
 #   强制 vLLM block FP8 linear 路径使用 Triton/FlagGems 相关实现，并处理 e8m0 scale。
 #
 # 用法:
-#   ./patch-vllm-fp8.sh --apply
-#   ./patch-vllm-fp8.sh --restore
-#   ./patch-vllm-fp8.sh --status
+#   ./patch-vllm-w8a8.sh --apply
+#   ./patch-vllm-w8a8.sh --restore
+#   ./patch-vllm-w8a8.sh --status
 #
 
 set -euo pipefail
@@ -38,9 +38,9 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-PATCH_MARKER="# >>> FLAGGEMS FP8 PATCH >>>"
-PATCH_END="# <<< FLAGGEMS FP8 PATCH <<<"
-BAK_SUFFIX=".fp8bak"
+PATCH_MARKER="# >>> FLAGGEMS W8A8 PATCH >>>"
+PATCH_END="# <<< FLAGGEMS W8A8 PATCH <<<"
+BAK_SUFFIX=".w8a8bak"
 OTHER_FP8_UTILS_MARKERS=(
     "# >>> FLAGGEMS PER_TOKEN_GROUP_FP8 PATCH >>>"
 )
@@ -222,7 +222,7 @@ restore() {
 }
 
 check_status() {
-    echo "=== FP8 补丁状态 ==="
+    echo "=== W8A8 补丁状态 ==="
     for f in "${TARGETS[@]}"; do
         local name
         name=$(basename "$f")
@@ -455,7 +455,7 @@ if marker in content or end_marker in content:
     start = content.find(marker)
     end = content.find(end_marker, start + len(marker))
     if start == -1 or end == -1:
-        print("WARN: TritonFp8BlockScaledMMKernel fp8 marker 不完整",
+        print("WARN: TritonFp8BlockScaledMMKernel w8a8 marker 不完整",
               file=sys.stderr)
         sys.exit(1)
     line_start = content.rfind("\n", 0, start) + 1
@@ -501,7 +501,7 @@ with open(filepath, "r") as f:
     content = f.read()
 
 if marker in content or end_marker in content:
-    print("ERROR: input_quant_fp8.py 存在不完整或旧版 fp8 marker", file=sys.stderr)
+    print("ERROR: input_quant_fp8.py 存在不完整或旧版 w8a8 marker", file=sys.stderr)
     sys.exit(1)
 
 old = """        if self.is_group_quant and not self.static:
@@ -629,7 +629,7 @@ if [[ "$ACTION" == "restore" ]]; then
     state="$(patch_state)"
     case "$state" in
         clean)
-            log_info "未检测到 fp8 补丁，无需还原"
+            log_info "未检测到 w8a8 补丁，无需还原"
             flagtune_emit_result "ALREADY_RESTORED"
             ;;
         patched_correct|patched_invalid)
@@ -649,12 +649,12 @@ if [[ "$ACTION" == "restore" ]]; then
             flagtune_emit_result "RESTORED"
             ;;
         patched_correct_backup_missing)
-            log_error "fp8 补丁已存在，但至少一个备份丢失"
+            log_error "w8a8 补丁已存在，但至少一个备份丢失"
             flagtune_emit_result "BACKUP_MISSING"
             exit 1
             ;;
         target_mismatch)
-            log_error "fp8 目标文件和补丁脚本预期不匹配"
+            log_error "w8a8 目标文件和补丁脚本预期不匹配"
             flagtune_emit_result "TARGET_MISMATCH"
             exit 1
             ;;
@@ -664,20 +664,20 @@ fi
 
 case "$(patch_state)" in
     patched_correct)
-        log_warn "fp8 四个补丁点均已正确应用，跳过"
+        log_warn "w8a8 四个补丁点均已正确应用，跳过"
         flagtune_emit_result "ALREADY_PATCHED"
         exit 0
         ;;
     patched_correct_backup_missing)
-        log_warn "fp8 四个补丁点均已正确应用，但至少一个备份缺失"
+        log_warn "w8a8 四个补丁点均已正确应用，但至少一个备份缺失"
         flagtune_emit_result "ALREADY_PATCHED_BACKUP_MISSING"
         exit 0
         ;;
     patched_invalid)
-        log_warn "fp8 补丁存在旧版或部分应用状态，将尝试补齐"
+        log_warn "w8a8 补丁存在旧版或部分应用状态，将尝试补齐"
         ;;
     target_mismatch)
-        log_error "fp8 目标文件和补丁脚本预期不匹配"
+        log_error "w8a8 目标文件和补丁脚本预期不匹配"
         flagtune_emit_result "TARGET_MISMATCH"
         exit 1
         ;;

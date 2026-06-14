@@ -6,8 +6,8 @@
 #   ./patch-vllm-all.sh --apply        # 应用所有补丁
 #   ./patch-vllm-all.sh --restore      # 还原所有补丁
 #   ./patch-vllm-all.sh --status       # 查看所有补丁状态
-#   ./patch-vllm-all.sh --apply  --only fp8,mm       # 仅应用指定补丁
-#   ./patch-vllm-all.sh --restore --only fp8,mm      # 仅还原指定补丁
+#   ./patch-vllm-all.sh --apply  --only w8a8,mm       # 仅应用指定补丁
+#   ./patch-vllm-all.sh --restore --only w8a8,mm      # 仅还原指定补丁
 #
 
 set -uo pipefail
@@ -27,10 +27,10 @@ NC='\033[0m'
 # 格式: "短名称:脚本文件名:描述"
 # ============================================================
 PATCHES=(
-    "fp8:patch-vllm-fp8.sh:FP8 quantization (cutlass_scaled_mm)"
+    "w8a8:patch-vllm-w8a8.sh:W8A8 block-scaled matrix multiplication"
     "router-gemm:patch-vllm-router-gemm.sh:Router GEMM (gate linear)"
     "flashmla-sparse:patch-vllm-flashmla-sparse.sh:FlashMLA sparse (flash_mla_sparse_fwd)"
-    "flashmla:patch-vllm-flashmla.sh:FlashMLA (flash_mla_with_kvcache)"
+    "flashmla-with-kvcache:patch-vllm-flashmla-with-kvcache.sh:FlashMLA (flash_mla_with_kvcache)"
     "fp8-einsum:patch-vllm-fp8-einsum.sh:FP8 Einsum (fp8_einsum_2x)"
     "indexer-k-quant:patch-vllm-indexer-k-quant.sh:Indexer K quant (indexer_k_quant_and_cache)"
     "cp-gather-indexer:patch-vllm-cp-gather-indexer.sh:CP gather indexer (cp_gather_indexer_k_quant_cache)"
@@ -124,6 +124,36 @@ should_process() {
     return 1
 }
 
+validate_only_list() {
+    local part entry name found
+
+    [[ -z "$ONLY_LIST" ]] && return 0
+
+    IFS=',' read -ra parts <<< "$ONLY_LIST"
+    for part in "${parts[@]}"; do
+        part="${part// /}"
+        if [[ -z "$part" ]]; then
+            echo -e "${RED}[ERROR]${NC} --only 包含空的补丁名称"
+            exit 1
+        fi
+
+        found=false
+        for entry in "${PATCHES[@]}"; do
+            name="${entry%%:*}"
+            if [[ "$part" == "$name" ]]; then
+                found=true
+                break
+            fi
+        done
+
+        if [[ "$found" != true ]]; then
+            echo -e "${RED}[ERROR]${NC} 未知补丁名称: $part"
+            echo "使用 -h 查看可用补丁名称"
+            exit 1
+        fi
+    done
+}
+
 extract_result() {
     local output="$1"
     echo "$output" | awk -F= '/^FLAGTUNE_RESULT=/{result=$2} END{print result}'
@@ -137,6 +167,8 @@ print_child_error() {
 # ============================================================
 # 主逻辑
 # ============================================================
+
+validate_only_list
 
 echo -e "${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BOLD}║       FlagGems → vLLM 补丁管理器                           ║${NC}"

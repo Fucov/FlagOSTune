@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# patch-vllm-flashmla.sh - 将 vLLM 的 flash_mla_with_kvcache 替换为 FlagGems Triton 实现
+# patch-vllm-flashmla-with-kvcache.sh - 将 vLLM 的 flash_mla_with_kvcache 替换为 FlagGems Triton 实现
 #
 # 补丁点:
 #   vllm/third_party/flashmla/flash_mla_interface.py
@@ -11,9 +11,9 @@
 #   保留文件中的其他函数（flash_mla_sparse_fwd、flash_attn_varlen_* 等）。
 #
 # 用法:
-#   ./patch-vllm-flashmla.sh --apply
-#   ./patch-vllm-flashmla.sh --restore
-#   ./patch-vllm-flashmla.sh --status
+#   ./patch-vllm-flashmla-with-kvcache.sh --apply
+#   ./patch-vllm-flashmla-with-kvcache.sh --restore
+#   ./patch-vllm-flashmla-with-kvcache.sh --status
 #
 
 set -euo pipefail
@@ -31,8 +31,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/patch-vllm-common.sh"
 PYTHON_EXECUTABLE="${Python_EXECUTABLE:-python3}"
 
-PATCH_MARKER="# >>> FLAGGEMS FLASHMLA PATCH >>>"
-PATCH_END="# <<< FLAGGEMS FLASHMLA PATCH <<<"
+PATCH_MARKER="# >>> FLAGGEMS FLASHMLA WITH KVCACHE PATCH >>>"
+PATCH_END="# <<< FLAGGEMS FLASHMLA WITH KVCACHE PATCH <<<"
 
 ACTION=""
 
@@ -87,7 +87,7 @@ if ! TARGET="$(detect_target)"; then
     flagtune_emit_result "TARGET_MISMATCH"
     exit 1
 fi
-BACKUP="${TARGET}.flashmlabak"
+BACKUP="${TARGET}.flashmla_with_kvcache_bak"
 
 if [[ ! -f "$TARGET" ]]; then
     log_error "目标文件不存在: $TARGET"
@@ -158,22 +158,22 @@ do_restore() {
 do_patch() {
     case "$(patch_state)" in
         patched_correct)
-            log_warn "已经有正确 flashmla 补丁，跳过"
+            log_warn "已经有正确 flashmla-with-kvcache 补丁，跳过"
             flagtune_emit_result "ALREADY_PATCHED"
             return 0
             ;;
         patched_correct_backup_missing)
-            log_warn "已经有正确 flashmla 补丁，但备份缺失"
+            log_warn "已经有正确 flashmla-with-kvcache 补丁，但备份缺失"
             flagtune_emit_result "ALREADY_PATCHED_BACKUP_MISSING"
             return 0
             ;;
         patched_invalid)
-            log_error "flashmla 补丁不完整或不正确"
+            log_error "flashmla-with-kvcache 补丁不完整或不正确"
             flagtune_emit_result "PATCH_INVALID"
             return 1
             ;;
         target_mismatch)
-            log_error "flash_mla_interface.py 和 flashmla 补丁脚本预期不匹配"
+            log_error "flash_mla_interface.py 和 flashmla-with-kvcache 补丁脚本预期不匹配"
             flagtune_emit_result "TARGET_MISMATCH"
             return 1
             ;;
@@ -268,7 +268,7 @@ fi
 if [[ "$ACTION" == "restore" ]]; then
     case "$(patch_state)" in
         clean)
-            log_info "未检测到 flashmla 补丁，无需还原"
+            log_info "未检测到 flashmla-with-kvcache 补丁，无需还原"
             flagtune_emit_result "ALREADY_RESTORED"
             ;;
         patched_correct)
@@ -276,17 +276,17 @@ if [[ "$ACTION" == "restore" ]]; then
             flagtune_emit_result "RESTORED"
             ;;
         patched_correct_backup_missing)
-            log_error "flashmla 补丁已存在，但备份丢失: $BACKUP"
+            log_error "flashmla-with-kvcache 补丁已存在，但备份丢失: $BACKUP"
             flagtune_emit_result "BACKUP_MISSING"
             exit 1
             ;;
         patched_invalid)
-            log_error "flashmla 补丁不完整或不正确，拒绝还原"
+            log_error "flashmla-with-kvcache 补丁不完整或不正确，拒绝还原"
             flagtune_emit_result "PATCH_INVALID"
             exit 1
             ;;
         target_mismatch)
-            log_error "flash_mla_interface.py 和 flashmla 补丁脚本预期不匹配"
+            log_error "flash_mla_interface.py 和 flashmla-with-kvcache 补丁脚本预期不匹配"
             flagtune_emit_result "TARGET_MISMATCH"
             exit 1
             ;;

@@ -99,7 +99,7 @@ fi
 FP8_UTILS="${VLLM_DIR}/model_executor/layers/quantization/utils/fp8_utils.py"
 TARGETS=("$FP8_UTILS")
 OTHER_SHARED_MARKERS=(
-    "# >>> FLAGGEMS FP8 PATCH >>>"
+    "# >>> FLAGGEMS W8A8 PATCH >>>"
 )
 
 target_matches() {

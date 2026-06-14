@@ -9,7 +9,7 @@
 # 行为:
 #   在 vLLM FlashMLA op 导入处注入兼容包装层，保留 flash_mla_with_kvcache 等其它导入。
 #
-# 注意: flash_mla_with_kvcache 由 patch-vllm-flashmla.sh 管理，本脚本不涉及。
+# 注意: flash_mla_with_kvcache 由 patch-vllm-flashmla-with-kvcache.sh 管理，本脚本不涉及。
 #
 # 用法:
 #   ./patch-vllm-flashmla-sparse.sh --apply

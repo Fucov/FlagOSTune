@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
-# bench-vllm-patches-fp8-router-mm-gems-null-flagtune.sh - Benchmark selected
-# vLLM patches with GEMS NULL mode and USE_FLAGTUNE=1.
+# bench-vllm-patches-one-by-one-gems-null.sh - Benchmark vLLM patches one by one
+# with GEMS NULL mode.
 #
 # Usage:
-#   ./scripts/bench-vllm-patches-fp8-router-mm-gems-null-flagtune.sh
-#   ./scripts/bench-vllm-patches-fp8-router-mm-gems-null-flagtune.sh --dry-run
+#   ./scripts/bench-vllm-patches-one-by-one-gems-null.sh
+#   ./scripts/bench-vllm-patches-one-by-one-gems-null.sh --only w8a8,mm
+#   ./scripts/bench-vllm-patches-one-by-one-gems-null.sh --dry-run
 #
 
 set -euo pipefail
@@ -29,17 +30,23 @@ log_section() { echo -e "\n${CYAN}========================================${NC}"
 MODEL_CONFIG="DeepSeek-V4-Flash"
 DEVICE="0"
 RUNS="5"
-WARMUP="2"
 ONLY_LIST=""
 DRY_RUN=false
 CONTINUE_ON_ERROR=false
+SKIP_CUDA_BASELINE=false
 REPORT_DATE="$(date +%F)"
 CURRENT_OP=""
 CURRENT_APPLIED=false
 
 PATCH_OPS=(
-    "fp8"
+    "w8a8"
     "router-gemm"
+    "flashmla-sparse"
+    "flashmla-with-kvcache"
+    "fp8-einsum"
+    "indexer-k-quant"
+    "cp-gather-indexer"
+    "per-token-group-fp8"
     "mm"
 )
 
@@ -51,8 +58,8 @@ Options:
   --model NAME             Model config name (default: DeepSeek-V4-Flash)
   --device N               GPU device id (default: 0)
   --runs N                 Benchmark runs (default: 5)
-  --warmup N               Warmup runs to skip when processing (default: 2)
-  --only op1,op2           Run only selected operators from fp8,router-gemm,mm
+  --only op1,op2           Run only selected operators; marlin-moe is never run
+  --skip-cuda-baseline     Skip the initial clean CUDA baseline run
   --dry-run                Print commands and report moves without running them
   --continue-on-error      Restore failed operator and continue with the next one
   -h, --help               Show this help
@@ -77,16 +84,16 @@ parse_args() {
                 RUNS="$2"
                 shift 2
                 ;;
-            --warmup)
-                WARMUP="$2"
-                shift 2
-                ;;
             --only)
                 ONLY_LIST="$2"
                 shift 2
                 ;;
             --dry-run)
                 DRY_RUN=true
+                shift
+                ;;
+            --skip-cuda-baseline)
+                SKIP_CUDA_BASELINE=true
                 shift
                 ;;
             --continue-on-error)
@@ -117,14 +124,6 @@ validate_args() {
     fi
     if [[ ! "$RUNS" =~ ^[1-9][0-9]*$ ]]; then
         log_error "--runs must be a positive integer: $RUNS"
-        exit 1
-    fi
-    if [[ ! "$WARMUP" =~ ^[0-9]+$ ]]; then
-        log_error "--warmup must be a non-negative integer: $WARMUP"
-        exit 1
-    fi
-    if (( RUNS < WARMUP + 3 )); then
-        log_error "--runs must be at least --warmup + 3 because processing collects 3 runs: runs=$RUNS warmup=$WARMUP"
         exit 1
     fi
 }
@@ -213,7 +212,7 @@ report_paths_for_op() {
     local ext="$2"
     local report_dir="${PROJECT_ROOT}/reports/${MODEL_CONFIG}"
     local src="${report_dir}/bench-optimized-report-${REPORT_DATE}.${ext}"
-    local dst="${report_dir}/bench-optimized-report-${REPORT_DATE}-gems-null-flagtune-${op}.${ext}"
+    local dst="${report_dir}/bench-optimized-report-${REPORT_DATE}-gems-null-${op}.${ext}"
     printf '%s\n%s\n' "$src" "$dst"
 }
 
@@ -258,6 +257,32 @@ rename_reports() {
     done
 }
 
+run_cuda_baseline() {
+    log_section "CUDA baseline"
+
+    CURRENT_OP=""
+    CURRENT_APPLIED=false
+
+    log_step "Restore all patches"
+    run_cmd "${SCRIPT_DIR}/patch-vllm-all.sh" --restore || return $?
+
+    log_step "Run CUDA baseline benchmark"
+    run_cmd "${SCRIPT_DIR}/auto-workflow.sh" \
+        --model "$MODEL_CONFIG" \
+        --device "$DEVICE" \
+        --scenario optimized \
+        --mode cuda \
+        --runs "$RUNS" || return $?
+
+    log_step "Process bench results"
+    run_cmd "${SCRIPT_DIR}/auto-processing.sh" \
+        --model "$MODEL_CONFIG" \
+        --workflow bench || return $?
+
+    log_step "Rename CUDA baseline reports"
+    rename_reports "cuda" || return $?
+}
+
 run_one_op() {
     local op="$1"
 
@@ -276,15 +301,12 @@ run_one_op() {
         --device "$DEVICE" \
         --mode gems \
         --gems-mode NULL \
-        --scenario optimized \
-        --runs "$RUNS" \
-        --pretune || return $?
+        --scenario optimized || return $?
 
     log_step "Process bench results"
     run_cmd "${SCRIPT_DIR}/auto-processing.sh" \
         --model "$MODEL_CONFIG" \
-        --workflow bench \
-        --warmup "$WARMUP" || return $?
+        --workflow bench || return $?
 
     log_step "Rename reports"
     rename_reports "$op" || return $?
@@ -307,10 +329,16 @@ main() {
     log_info "Model: $MODEL_CONFIG"
     log_info "Device: $DEVICE"
     log_info "Runs: $RUNS"
-    log_info "Warmup: $WARMUP"
     log_info "Report date: $REPORT_DATE"
+    if [[ "$SKIP_CUDA_BASELINE" == true ]]; then
+        log_warn "Skipping initial CUDA baseline"
+    fi
     if [[ "$DRY_RUN" == true ]]; then
         log_warn "Dry run: commands will be printed but not executed"
+    fi
+
+    if [[ "$SKIP_CUDA_BASELINE" != true ]]; then
+        run_cuda_baseline
     fi
 
     local op status failed=0 selected=0
