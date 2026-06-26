@@ -31,7 +31,8 @@ serve:
   reasoning_parser: deepseek_v4
   load_format: auto
   # 额外参数 (将直接传递给 vllm serve)
-  extra_args: "--kv_cache_dtype fp8"
+  extra_args: "--kv_cache_dtype fp8 --max-model-len 65536 --no-enable-prefix-caching"
+
 
 # ===================
 # 基准测试配置
