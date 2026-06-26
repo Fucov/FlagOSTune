@@ -34,6 +34,7 @@ ONLY_LIST=""
 DRY_RUN=false
 CONTINUE_ON_ERROR=false
 REPORT_DATE="$(date +%F)"
+ARCHIVE_RUN_ID="$(date +%Y%m%d-%H%M%S)"
 CURRENT_OP=""
 CURRENT_APPLIED=false
 
@@ -42,6 +43,30 @@ PATCH_OPS=(
     "router-gemm"
     "mm"
 )
+
+canonical_op_name() {
+    local op="$1"
+    op="${op// /}"
+    op="${op//_/-}"
+
+    case "$op" in
+        w8a8|w8a8-block-fp8-matmul)
+            printf '%s\n' "w8a8"
+            ;;
+        mm)
+            printf '%s\n' "mm"
+            ;;
+        router-gemm|router-gemm-bf16-fp32)
+            printf '%s\n' "router-gemm"
+            ;;
+        marlin-moe)
+            printf '%s\n' "$op"
+            ;;
+        *)
+            printf '%s\n' "$op"
+            ;;
+    esac
+}
 
 usage() {
     cat <<EOF
@@ -52,7 +77,7 @@ Options:
   --device N               GPU device id (default: 0)
   --runs N                 Benchmark runs (default: 5)
   --warmup N               Warmup runs to skip when processing (default: 2)
-  --only op1,op2           Run only selected operators from w8a8,router-gemm,mm
+  --only op1,op2           Run only selected operators from the list below
   --dry-run                Print commands and report moves without running them
   --continue-on-error      Restore failed operator and continue with the next one
   -h, --help               Show this help
@@ -138,7 +163,7 @@ should_run_op() {
 
     IFS=',' read -ra parts <<< "$ONLY_LIST"
     for part in "${parts[@]}"; do
-        part="${part// /}"
+        part="$(canonical_op_name "$part")"
         if [[ "$part" == "$op" ]]; then
             return 0
         fi
@@ -153,7 +178,7 @@ validate_only_list() {
 
     IFS=',' read -ra parts <<< "$ONLY_LIST"
     for part in "${parts[@]}"; do
-        part="${part// /}"
+        part="$(canonical_op_name "$part")"
         [[ -z "$part" ]] && continue
 
         if [[ "$part" == "marlin-moe" ]]; then
@@ -258,6 +283,40 @@ rename_reports() {
     done
 }
 
+archive_run_logs() {
+    local label="$1"
+    local source_dir="$2"
+    local archive_root="${PROJECT_ROOT}/results/${MODEL_CONFIG}/bench_optimized_log/archive/${ARCHIVE_RUN_ID}"
+    local target_dir="${archive_root}/${label}"
+    local found=false
+    local log_file
+
+    if [[ "$DRY_RUN" == true ]]; then
+        printf '+ mkdir -p %q\n' "$target_dir"
+        printf '+ cp %q %q\n' "${source_dir}/*run*.log" "${target_dir}/"
+        return 0
+    fi
+
+    if [[ ! -d "$source_dir" ]]; then
+        log_warn "Run log source dir does not exist, skip archive: $source_dir"
+        return 0
+    fi
+
+    mkdir -p "$target_dir"
+    shopt -s nullglob
+    for log_file in "${source_dir}"/*run*.log; do
+        cp -p "$log_file" "$target_dir/"
+        found=true
+    done
+    shopt -u nullglob
+
+    if [[ "$found" == true ]]; then
+        log_info "Archived run logs: $target_dir"
+    else
+        log_warn "No *run*.log found to archive under: $source_dir"
+    fi
+}
+
 run_one_op() {
     local op="$1"
 
@@ -288,6 +347,10 @@ run_one_op() {
 
     log_step "Rename reports"
     rename_reports "$op" || return $?
+
+    log_step "Archive FlagOSTune run logs"
+    archive_run_logs "${op}-flagtune" \
+        "${PROJECT_ROOT}/results/${MODEL_CONFIG}/bench_optimized_log/vllm_bench_gems_NULL_pretune_logs" || return $?
 
     log_step "Restore patch"
     run_cmd "${SCRIPT_DIR}/patch-vllm-all.sh" --restore --only "$op" || return $?

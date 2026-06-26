@@ -1,0 +1,13 @@
+paths:
+  results: results
+  reports: reports
+  use_model_name: true
+  gems_config: gems-config
+  log_dir: results/DeepSeek-V4-Flash/bench_log
+  server_log_dir: results/DeepSeek-V4-Flash/server-logs
+  nsys_output_dir: results/DeepSeek-V4-Flash/nsys-raw
+  torch_output_dir: results/DeepSeek-V4-Flash/torch-raw
+  reports_dir: reports/DeepSeek-V4-Flash
+  model_name: DeepSeek-V4-Flash
+  gems_config_dir: results/DeepSeek-V4-Flash/gems-config
+  gems_config_shape_dir: results/DeepSeek-V4-Flash/gems-config-shape

@@ -6,6 +6,7 @@
 # Usage:
 #   ./scripts/bench-vllm-patches-one-by-one-gems-null.sh
 #   ./scripts/bench-vllm-patches-one-by-one-gems-null.sh --only w8a8,mm
+#   ./scripts/bench-vllm-patches-one-by-one-gems-null.sh --only fused-marlin-moe
 #   ./scripts/bench-vllm-patches-one-by-one-gems-null.sh --dry-run
 #
 
@@ -35,12 +36,16 @@ DRY_RUN=false
 CONTINUE_ON_ERROR=false
 SKIP_CUDA_BASELINE=false
 REPORT_DATE="$(date +%F)"
+ARCHIVE_RUN_ID="$(date +%Y%m%d-%H%M%S)"
 CURRENT_OP=""
 CURRENT_APPLIED=false
 
 PATCH_OPS=(
     "w8a8"
     "router-gemm"
+    "fused-marlin-moe"
+    "compute-global-topk-indices-and-lens"
+    "topk-softplus-sqrt"
     "flashmla-sparse"
     "flashmla-with-kvcache"
     "fp8-einsum"
@@ -50,6 +55,57 @@ PATCH_OPS=(
     "mm"
 )
 
+canonical_op_name() {
+    local op="$1"
+    op="${op// /}"
+    op="${op//_/-}"
+
+    case "$op" in
+        w8a8|w8a8-block-fp8-matmul)
+            printf '%s\n' "w8a8"
+            ;;
+        mm)
+            printf '%s\n' "mm"
+            ;;
+        router-gemm|router-gemm-bf16-fp32)
+            printf '%s\n' "router-gemm"
+            ;;
+        fused-marlin-moe)
+            printf '%s\n' "fused-marlin-moe"
+            ;;
+        flashmla-sparse|flash-mla-sparse)
+            printf '%s\n' "flashmla-sparse"
+            ;;
+        flashmla-with-kvcache|flash-mla-with-kvcache)
+            printf '%s\n' "flashmla-with-kvcache"
+            ;;
+        fp8-einsum|deepseek-v4-fp8-einsum)
+            printf '%s\n' "fp8-einsum"
+            ;;
+        indexer-k-quant|indexer-k-quant-and-cache)
+            printf '%s\n' "indexer-k-quant"
+            ;;
+        cp-gather-indexer|cp-gather-indexer-k-quant-cache)
+            printf '%s\n' "cp-gather-indexer"
+            ;;
+        per-token-group-fp8|per-token-group-fp8-quant)
+            printf '%s\n' "per-token-group-fp8"
+            ;;
+        compute-global-topk-indices-and-lens)
+            printf '%s\n' "compute-global-topk-indices-and-lens"
+            ;;
+        topk-softplus-sqrt)
+            printf '%s\n' "topk-softplus-sqrt"
+            ;;
+        marlin-moe)
+            printf '%s\n' "$op"
+            ;;
+        *)
+            printf '%s\n' "$op"
+            ;;
+    esac
+}
+
 usage() {
     cat <<EOF
 Usage: $0 [options]
@@ -58,7 +114,7 @@ Options:
   --model NAME             Model config name (default: DeepSeek-V4-Flash)
   --device N               GPU device id (default: 0)
   --runs N                 Benchmark runs (default: 5)
-  --only op1,op2           Run only selected operators; marlin-moe is never run
+  --only op1,op2           Run only selected operators from the list below
   --skip-cuda-baseline     Skip the initial clean CUDA baseline run
   --dry-run                Print commands and report moves without running them
   --continue-on-error      Restore failed operator and continue with the next one
@@ -137,7 +193,7 @@ should_run_op() {
 
     IFS=',' read -ra parts <<< "$ONLY_LIST"
     for part in "${parts[@]}"; do
-        part="${part// /}"
+        part="$(canonical_op_name "$part")"
         if [[ "$part" == "$op" ]]; then
             return 0
         fi
@@ -152,7 +208,7 @@ validate_only_list() {
 
     IFS=',' read -ra parts <<< "$ONLY_LIST"
     for part in "${parts[@]}"; do
-        part="${part// /}"
+        part="$(canonical_op_name "$part")"
         [[ -z "$part" ]] && continue
 
         if [[ "$part" == "marlin-moe" ]]; then
@@ -257,6 +313,40 @@ rename_reports() {
     done
 }
 
+archive_run_logs() {
+    local label="$1"
+    local source_dir="$2"
+    local archive_root="${PROJECT_ROOT}/results/${MODEL_CONFIG}/bench_optimized_log/archive/${ARCHIVE_RUN_ID}"
+    local target_dir="${archive_root}/${label}"
+    local found=false
+    local log_file
+
+    if [[ "$DRY_RUN" == true ]]; then
+        printf '+ mkdir -p %q\n' "$target_dir"
+        printf '+ cp %q %q\n' "${source_dir}/*run*.log" "${target_dir}/"
+        return 0
+    fi
+
+    if [[ ! -d "$source_dir" ]]; then
+        log_warn "Run log source dir does not exist, skip archive: $source_dir"
+        return 0
+    fi
+
+    mkdir -p "$target_dir"
+    shopt -s nullglob
+    for log_file in "${source_dir}"/*run*.log; do
+        cp -p "$log_file" "$target_dir/"
+        found=true
+    done
+    shopt -u nullglob
+
+    if [[ "$found" == true ]]; then
+        log_info "Archived run logs: $target_dir"
+    else
+        log_warn "No *run*.log found to archive under: $source_dir"
+    fi
+}
+
 run_cuda_baseline() {
     log_section "CUDA baseline"
 
@@ -281,6 +371,10 @@ run_cuda_baseline() {
 
     log_step "Rename CUDA baseline reports"
     rename_reports "cuda" || return $?
+
+    log_step "Archive CUDA run logs"
+    archive_run_logs "cuda" \
+        "${PROJECT_ROOT}/results/${MODEL_CONFIG}/bench_optimized_log/vllm_bench_cuda_logs" || return $?
 }
 
 run_one_op() {
@@ -310,6 +404,10 @@ run_one_op() {
 
     log_step "Rename reports"
     rename_reports "$op" || return $?
+
+    log_step "Archive GEMS NULL run logs"
+    archive_run_logs "$op" \
+        "${PROJECT_ROOT}/results/${MODEL_CONFIG}/bench_optimized_log/vllm_bench_gems_NULL_logs" || return $?
 
     log_step "Restore patch"
     run_cmd "${SCRIPT_DIR}/patch-vllm-all.sh" --restore --only "$op" || return $?

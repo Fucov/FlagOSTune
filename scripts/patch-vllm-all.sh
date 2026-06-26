@@ -29,6 +29,9 @@ NC='\033[0m'
 PATCHES=(
     "w8a8:patch-vllm-w8a8.sh:W8A8 block-scaled matrix multiplication"
     "router-gemm:patch-vllm-router-gemm.sh:Router GEMM (gate linear)"
+    "fused-marlin-moe:patch-vllm-fused-marlin-moe.sh:Fused Marlin MoE"
+    "compute-global-topk-indices-and-lens:patch-vllm-compute-global-topk-indices-and-lens.sh:DeepSeek V4 C128A global topk indices and lens"
+    "topk-softplus-sqrt:patch-vllm-topk-softplus-sqrt.sh:topk_softplus_sqrt MoE gating"
     "flashmla-sparse:patch-vllm-flashmla-sparse.sh:FlashMLA sparse (flash_mla_sparse_fwd)"
     "flashmla-with-kvcache:patch-vllm-flashmla-with-kvcache.sh:FlashMLA (flash_mla_with_kvcache)"
     "fp8-einsum:patch-vllm-fp8-einsum.sh:FP8 Einsum (fp8_einsum_2x)"
