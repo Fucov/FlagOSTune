@@ -52,11 +52,14 @@ PH_X_MARKER = b'"ph": "X"'
 CPU_OP_CAT_MARKER = b'"cat": "cpu_op"'
 PYTHON_FUNC_CAT_MARKER = b'"cat": "python_function"'
 KERNEL_CAT_MARKER = b'"cat": "kernel"'
+AC2G_CAT_MARKER = b'"cat": "ac2g"'
 NAME_MARKER = b'"name": "'
+ID_MARKER = b'"id": '
 TID_MARKER = b'"tid": '
 TS_MARKER = b'"ts": '
 DUR_MARKER = b'"dur": '
 EXTERNAL_ID_MARKER = b'"External id": '
+CORRELATION_MARKER = b'"correlation": '
 NUMERIC_STOP_BYTES = b",}\r\n] "
 _MMAP_CACHE: Dict[str, Tuple[Any, mmap.mmap]] = {}
 
@@ -362,15 +365,16 @@ def build_cpu_op_source_map_fast(
     cpu_op_sources: Dict[str, str] = {}
 
     for tid, cpu_events in cpu_ops_by_tid.items():
-        frames = python_frames_by_tid.get(tid, [])
-        if not frames or not cpu_events:
+        frames = sorted(python_frames_by_tid.get(tid, []), key=lambda x: x[0])
+        sorted_cpu_events = sorted(cpu_events, key=lambda x: x[0])
+        if not frames or not sorted_cpu_events:
             continue
 
         active_frames: List[Tuple[float, str]] = []
         frame_idx = 0
         frame_count = len(frames)
 
-        for ts, ext_id in cpu_events:
+        for ts, ext_id in sorted_cpu_events:
             while frame_idx < frame_count and frames[frame_idx][0] <= ts:
                 start_ts, end_ts, source_file = frames[frame_idx]
                 frame_idx += 1
@@ -385,6 +389,41 @@ def build_cpu_op_source_map_fast(
                 active_frames, cpu_op_names.get(ext_id, UNMAPPED_OP_NAME))
 
     return cpu_op_sources
+
+
+def build_timed_event_source_map(
+    python_frames_by_tid: Dict[int, List[Tuple[float, float, str]]],
+    events_by_tid: Dict[int, List[Tuple[float, str]]],
+    event_op_names: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    event_sources: Dict[str, str] = {}
+
+    for tid, events in events_by_tid.items():
+        frames = sorted(python_frames_by_tid.get(tid, []), key=lambda x: x[0])
+        sorted_events = sorted(events, key=lambda x: x[0])
+        if not frames or not sorted_events:
+            continue
+
+        active_frames: List[Tuple[float, str]] = []
+        frame_idx = 0
+        frame_count = len(frames)
+
+        for ts, event_key in sorted_events:
+            while frame_idx < frame_count and frames[frame_idx][0] <= ts:
+                start_ts, end_ts, source_file = frames[frame_idx]
+                frame_idx += 1
+                while active_frames and start_ts >= active_frames[-1][0]:
+                    active_frames.pop()
+                active_frames.append((end_ts, source_file))
+
+            while active_frames and ts > active_frames[-1][0]:
+                active_frames.pop()
+
+            op_name = event_op_names.get(event_key, UNMAPPED_OP_NAME) if event_op_names else UNMAPPED_OP_NAME
+            event_sources[event_key] = pick_preferred_source_file_from_active_frames(
+                active_frames, op_name)
+
+    return event_sources
 
 
 @dataclass(frozen=True)
@@ -405,10 +444,43 @@ class OpAggStat:
     total_us: float
 
 
+@dataclass(frozen=True)
+class KernelSectionParseResult:
+    kernel_agg: Dict[Tuple[str, str, str], Tuple[int, float]]
+    launches_by_tid: Dict[int, List[Tuple[float, str]]]
+
+
 def resolve_op_name(cpu_names: Set[str]) -> str:
     if not cpu_names:
         return UNMAPPED_OP_NAME
     return format_op_names(cpu_names)
+
+
+def resolve_unmapped_op_name(kernel_name: str) -> str:
+    return f"({UNMAPPED_OP_NAME}){kernel_name}" if kernel_name else UNMAPPED_OP_NAME
+
+
+def finalize_kernel_aggregates(
+    raw_kernel_agg: Dict[Tuple[str, str, str], Tuple[int, float]],
+    cpu_op_names: Dict[str, str],
+    cpu_op_sources: Dict[str, str],
+    launch_sources: Dict[str, str],
+) -> Dict[Tuple[str, str, str], Tuple[int, float]]:
+    kernel_agg: Dict[Tuple[str, str, str], List[float]] = defaultdict(lambda: [0.0, 0.0])
+
+    for (ext_key, kernel_name, correlation_key), (calls, total_us) in raw_kernel_agg.items():
+        if ext_key and ext_key in cpu_op_names:
+            op_name = cpu_op_names[ext_key]
+            source_file = cpu_op_sources.get(ext_key, "")
+        else:
+            op_name = resolve_unmapped_op_name(kernel_name)
+            source_file = launch_sources.get(correlation_key, "") if correlation_key else ""
+
+        key = (op_name, kernel_name, source_file)
+        kernel_agg[key][0] += float(calls)
+        kernel_agg[key][1] += total_us
+
+    return {k: (int(v[0]), float(v[1])) for k, v in kernel_agg.items()}
 
 
 def merge_op_name(existing: Optional[str], new_name: str) -> str:
@@ -671,24 +743,27 @@ def parse_trace_file_aggregates(
     cpu_op_names: Dict[str, str] = {}
     python_frames_by_tid: Dict[int, List[Tuple[float, float, str]]] = defaultdict(list)
     cpu_ops_by_tid: Dict[int, List[Tuple[float, str]]] = defaultdict(list)
-    source_needed_tids: Set[int] = set()
-    kernel_agg: Dict[Tuple[str, str, str], List[float]] = defaultdict(lambda: [0.0, 0.0])
-    cpu_op_sources: Optional[Dict[str, str]] = None
+    launches_by_tid: Dict[int, List[Tuple[float, str]]] = defaultdict(list)
+    raw_kernel_agg: Dict[Tuple[str, str, str], List[float]] = defaultdict(lambda: [0.0, 0.0])
 
     for event in iter_trace_events(trace_file):
-        if event.get("ph") != "X":
-            continue
-
         cat = str(event.get("cat", ""))
         args = event.get("args") if isinstance(event.get("args"), dict) else {}
         ext_id = args.get("External id")
         tid = event.get("tid")
         ts = event.get("ts")
 
+        if event.get("ph") == "s" and cat == "ac2g" and tid is not None and ts is not None:
+            correlation_id = event.get("id")
+            if correlation_id is not None:
+                launches_by_tid[int(tid)].append((float(ts), str(correlation_id)))
+            continue
+
+        if event.get("ph") != "X":
+            continue
+
         if cat == "python_function" and tid is not None and ts is not None:
             tid_int = int(tid)
-            if tid_int not in source_needed_tids:
-                continue
             dur = event.get("dur")
             if not isinstance(dur, numbers.Number):
                 continue
@@ -706,7 +781,6 @@ def parse_trace_file_aggregates(
             if not is_aten_op(op_name):
                 tid_int = int(tid)
                 cpu_ops_by_tid[tid_int].append((float(ts), ext_key))
-                source_needed_tids.add(tid_int)
             continue
 
         if cat != "kernel":
@@ -716,25 +790,27 @@ def parse_trace_file_aggregates(
         if not isinstance(dur, numbers.Number):
             continue
 
-        if cpu_op_sources is None:
-            cpu_op_sources = build_cpu_op_source_map_fast(
-                python_frames_by_tid,
-                cpu_ops_by_tid,
-                cpu_op_names,
-            )
-            python_frames_by_tid.clear()
-            cpu_ops_by_tid.clear()
-            source_needed_tids.clear()
-
         kernel_name = normalize_kernel_name(str(event.get("name", "unknown")))
         ext_key = str(ext_id) if ext_id is not None else ""
-        op_name = cpu_op_names.get(ext_key, UNMAPPED_OP_NAME)
-        source_file = cpu_op_sources.get(ext_key, "") if cpu_op_sources else ""
-        key = (op_name, kernel_name, source_file)
-        kernel_agg[key][0] += 1.0
-        kernel_agg[key][1] += float(dur)
+        correlation = args.get("correlation")
+        correlation_key = "" if ext_key else (str(correlation) if correlation is not None else "")
+        key = (ext_key, kernel_name, correlation_key)
+        raw_kernel_agg[key][0] += 1.0
+        raw_kernel_agg[key][1] += float(dur)
 
-    return {k: (int(v[0]), float(v[1])) for k, v in kernel_agg.items()}
+    cpu_op_sources = build_cpu_op_source_map_fast(
+        python_frames_by_tid,
+        cpu_ops_by_tid,
+        cpu_op_names,
+    )
+    launch_sources = build_timed_event_source_map(python_frames_by_tid, launches_by_tid)
+
+    return finalize_kernel_aggregates(
+        {k: (int(v[0]), float(v[1])) for k, v in raw_kernel_agg.items()},
+        cpu_op_names,
+        cpu_op_sources,
+        launch_sources,
+    )
 
 
 def parse_cpu_section_range(
@@ -814,10 +890,19 @@ def parse_kernel_section_range(
     trace_file: Path,
     start_offset: int,
     end_offset: int,
-) -> Dict[Tuple[str, str], Tuple[int, float]]:
-    kernel_agg: Dict[Tuple[str, str], List[float]] = defaultdict(lambda: [0.0, 0.0])
+) -> KernelSectionParseResult:
+    kernel_agg: Dict[Tuple[str, str, str], List[float]] = defaultdict(lambda: [0.0, 0.0])
+    launches_by_tid: Dict[int, List[Tuple[float, str]]] = defaultdict(list)
 
     for raw in iter_event_objects_in_range(trace_file, start_offset, end_offset):
+        if AC2G_CAT_MARKER in raw:
+            correlation_id = extract_int_field(raw, ID_MARKER)
+            tid = extract_int_field(raw, TID_MARKER)
+            ts = extract_float_field(raw, TS_MARKER)
+            if correlation_id is not None and tid is not None and ts is not None:
+                launches_by_tid[tid].append((ts, str(correlation_id)))
+            continue
+
         if PH_X_MARKER not in raw or KERNEL_CAT_MARKER not in raw:
             continue
 
@@ -831,12 +916,17 @@ def parse_kernel_section_range(
 
         ext_id = extract_int_field(raw, EXTERNAL_ID_MARKER)
         ext_key = str(ext_id) if ext_id is not None else ""
+        correlation = extract_int_field(raw, CORRELATION_MARKER)
+        correlation_key = "" if ext_key else (str(correlation) if correlation is not None else "")
         kernel_name = normalize_kernel_name(kernel_name_raw)
-        key = (ext_key, kernel_name)
+        key = (ext_key, kernel_name, correlation_key)
         kernel_agg[key][0] += 1.0
         kernel_agg[key][1] += dur
 
-    return {k: (int(v[0]), float(v[1])) for k, v in kernel_agg.items()}
+    return KernelSectionParseResult(
+        kernel_agg={k: (int(v[0]), float(v[1])) for k, v in kernel_agg.items()},
+        launches_by_tid=dict(launches_by_tid),
+    )
 
 
 def parse_cpu_section_range_from_args(
@@ -855,7 +945,7 @@ def parse_python_section_range_from_args(
 
 def parse_kernel_section_range_from_args(
     args: Tuple[Path, int, int],
-) -> Dict[Tuple[str, str], Tuple[int, float]]:
+) -> KernelSectionParseResult:
     trace_file, start_offset, end_offset = args
     return parse_kernel_section_range(trace_file, start_offset, end_offset)
 
@@ -886,7 +976,22 @@ def parse_trace_file_aggregates_parallel(
             for tid, items in partial_ops.items():
                 cpu_ops_by_tid[tid].extend(items)
 
-        needed_tids = set(cpu_ops_by_tid.keys())
+        kernel_ranges = compute_chunk_ranges(trace_file, kernel_start, file_end, workers)
+        kernel_results = list(
+            executor.map(parse_kernel_section_range_from_args,
+                         ((trace_file, left, right) for left, right in kernel_ranges),
+                         chunksize=1))
+
+        raw_kernel_agg: Dict[Tuple[str, str, str], List[float]] = defaultdict(lambda: [0.0, 0.0])
+        launches_by_tid: Dict[int, List[Tuple[float, str]]] = defaultdict(list)
+        for partial_kernel in kernel_results:
+            for key, (calls, total_us) in partial_kernel.kernel_agg.items():
+                raw_kernel_agg[key][0] += float(calls)
+                raw_kernel_agg[key][1] += total_us
+            for tid, items in partial_kernel.launches_by_tid.items():
+                launches_by_tid[tid].extend(items)
+
+        needed_tids = set(cpu_ops_by_tid.keys()) | set(launches_by_tid.keys())
         python_ranges = compute_chunk_ranges(trace_file, python_start, kernel_start, workers)
         python_results = list(
             executor.map(parse_python_section_range_from_args,
@@ -901,23 +1006,14 @@ def parse_trace_file_aggregates_parallel(
 
         cpu_op_sources = build_cpu_op_source_map_fast(python_frames_by_tid, cpu_ops_by_tid,
                                                       cpu_op_names)
+        launch_sources = build_timed_event_source_map(python_frames_by_tid, launches_by_tid)
 
-        kernel_ranges = compute_chunk_ranges(trace_file, kernel_start, file_end, workers)
-        kernel_results = list(
-            executor.map(parse_kernel_section_range_from_args,
-                         ((trace_file, left, right) for left, right in kernel_ranges),
-                         chunksize=1))
-
-    kernel_agg: Dict[Tuple[str, str, str], List[float]] = defaultdict(lambda: [0.0, 0.0])
-    for partial_kernel in kernel_results:
-        for (ext_key, kernel_name), (calls, total_us) in partial_kernel.items():
-            op_name = cpu_op_names.get(ext_key, UNMAPPED_OP_NAME)
-            source_file = cpu_op_sources.get(ext_key, "")
-            key = (op_name, kernel_name, source_file)
-            kernel_agg[key][0] += float(calls)
-            kernel_agg[key][1] += total_us
-
-    return {k: (int(v[0]), float(v[1])) for k, v in kernel_agg.items()}
+    return finalize_kernel_aggregates(
+        {k: (int(v[0]), float(v[1])) for k, v in raw_kernel_agg.items()},
+        cpu_op_names,
+        cpu_op_sources,
+        launch_sources,
+    )
 
 
 def get_default_workers(num_files: int) -> int:
