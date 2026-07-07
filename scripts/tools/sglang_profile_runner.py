@@ -123,6 +123,7 @@ def validate_extra_args(extra_args: str) -> List[str]:
         "--quantization",
         "--load-format",
         "--profile",
+        "--language-only",
     }
 
     bad = []

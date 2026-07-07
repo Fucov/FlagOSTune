@@ -6,6 +6,7 @@ from scripts.tools.sglang_profile_runner import (
     build_sglang_command,
     get_scenarios,
     resolve_run_paths,
+    validate_extra_args,
 )
 
 
@@ -112,6 +113,10 @@ class SGLangProfileRunnerTest(unittest.TestCase):
             cmd = build_sglang_command(scenario, config, paths.profile_dir, profile=False)
 
         self.assertNotIn("--profile", cmd)
+
+    def test_validate_extra_args_rejects_language_only(self) -> None:
+        with self.assertRaises(SystemExit):
+            validate_extra_args("--skip-server-warmup --language-only")
 
 
 if __name__ == "__main__":

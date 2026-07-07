@@ -193,12 +193,32 @@ run_python_runner() {
     Python_EXECUTABLE="$Python_EXECUTABLE" "$Python_EXECUTABLE" "${SCRIPT_DIR}/tools/sglang_profile_runner.py" "${args[@]}"
 }
 
+patch_sglang_compat() {
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_warn "dry-run 模式跳过 SGLang Qwen3 vision_config 兼容补丁"
+        return 0
+    fi
+
+    local model_path model_name model_key
+    model_path=$(yq '.model.path // ""' "$TOOL_CONFIG")
+    model_name=$(yq '.model.name // ""' "$TOOL_CONFIG")
+    model_key="$(printf '%s %s' "$model_path" "$model_name" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$model_key" != *"qwen3"* ]]; then
+        log_info "非 Qwen3 模型，跳过 SGLang Qwen3 vision_config 兼容补丁"
+        return 0
+    fi
+
+    log_step "应用 SGLang Qwen3 vision_config 兼容补丁..."
+    "$Python_EXECUTABLE" "${SCRIPT_DIR}/tools/patch_sglang_qwen3_vision_config.py" --apply
+}
+
 main() {
     parse_args "$@"
     validate_args
     check_dependencies
     resolve_config_file
     update_tool_config
+    patch_sglang_compat
     run_python_runner
 }
 
