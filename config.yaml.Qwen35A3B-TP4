@@ -1,0 +1,32 @@
+model:
+  path: /data/models/Qwen3.5-35B-A3B
+  name: Qwen35A3B-TP4
+  tensor_parallel_size: 4
+  tokenizer_path: /data/models/Qwen3.5-35B-A3B
+
+serve:
+  trust_remote_code: true
+  extra_args: ""
+
+sglang:
+  dtype: bfloat16
+  mem_fraction_static: 0.50
+  extra_args: "--skip-server-warmup --max-total-tokens 4096"
+
+benchmark:
+  dataset_name: random
+  dataset_path: /data/yangkw/datasets/sharegpt_synthetic_2048.json
+  host: 127.0.0.1
+  port_base: 30100
+  num_runs: 2
+  scenarios:
+    optimized:
+      - name: p1024d128
+        input_len: 1024
+        output_len: 128
+        concurrency: 4
+
+paths:
+  results: /data/yangkw/outputs/flagostune_results
+  reports: /data/yangkw/outputs/flagostune_reports
+  use_model_name: true

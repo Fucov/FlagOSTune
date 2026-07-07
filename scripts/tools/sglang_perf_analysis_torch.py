@@ -22,25 +22,69 @@ except ImportError:  # pragma: no cover
     Workbook = None
 
 
-class DistributedOpKind(str, Enum):
-    ALL_REDUCE = "all_reduce"
-    ALL_GATHER = "all_gather"
-    REDUCE_SCATTER = "reduce_scatter"
-    ALL_TO_ALL = "all_to_all"
-    BROADCAST = "broadcast"
-    SEND_RECV = "send_recv"
-    BARRIER = "barrier"
-    OTHER_DISTRIBUTED = "other_distributed"
+class OpKind(str, Enum):
+    DISTRIBUTED_ALL_REDUCE = "distributed_all_reduce"
+    DISTRIBUTED_ALL_GATHER = "distributed_all_gather"
+    DISTRIBUTED_REDUCE_SCATTER = "distributed_reduce_scatter"
+    DISTRIBUTED_ALL_TO_ALL = "distributed_all_to_all"
+    DISTRIBUTED_BROADCAST = "distributed_broadcast"
+    DISTRIBUTED_P2P = "distributed_p2p"
+    DISTRIBUTED_NCCL_OTHER = "distributed_nccl_other"
+    ATTENTION = "attention"
+    MOE = "moe"
+    GEMM = "gemm"
+    NORM = "norm"
+    ACTIVATION = "activation"
+    KV_CACHE = "kv_cache"
+    INDEXING = "indexing"
+    MAMBA_OR_LINEAR_ATTENTION = "mamba_or_linear_attention"
+    NON_DISTRIBUTED = "non_distributed"
+
+    # Legacy enum member names; values intentionally use the new report labels.
+    ALL_REDUCE = "distributed_all_reduce"
+    ALL_GATHER = "distributed_all_gather"
+    REDUCE_SCATTER = "distributed_reduce_scatter"
+    ALL_TO_ALL = "distributed_all_to_all"
+    BROADCAST = "distributed_broadcast"
+    SEND_RECV = "distributed_p2p"
+    OTHER_DISTRIBUTED = "distributed_nccl_other"
 
 
-DISTRIBUTED_SOURCE_HINTS = (
-    "distributed",
-    "communicator",
-    "parallel",
-    "tensor_parallel",
-    "tp_group",
+# Backward-compatible export name used by existing tests/callers.
+DistributedOpKind = OpKind
+
+
+DISTRIBUTED_PREFIX = "distributed_"
+
+FLASH_ATTENTION_EXCLUSIONS = (
+    "collectivemainloop",
+    "collectiveepilogue",
+    "cutlass::device_kernel<flash::",
+    "flashattnfwd",
+    "flash::prepare_varlen",
+)
+
+REAL_COMMUNICATION_KEYWORDS = (
     "nccl",
-    "collective",
+    "all_reduce",
+    "allreduce",
+    "all_gather",
+    "allgather",
+    "reduce_scatter",
+    "reducescatter",
+    "all_to_all",
+    "alltoall",
+    "broadcast",
+    "send",
+    "recv",
+    "processgroup",
+    "c10d",
+    "record_param_comms",
+    "custom_ar",
+    "symm_mem all_reduce",
+    "multimem_all_reduce",
+    "vllm::all_reduce",
+    "_c_custom_ar::all_reduce",
 )
 
 
@@ -65,14 +109,14 @@ class KernelRecord:
     op_name: str
     source_file: str
     dur_us: float
-    kind: Optional[DistributedOpKind]
+    kind: OpKind
 
 
 @dataclass
 class RankStats:
     rank: int
     total_kernel_us: float = 0.0
-    distributed: DefaultDict[DistributedOpKind, Aggregate] = field(
+    distributed: DefaultDict[OpKind, Aggregate] = field(
         default_factory=lambda: defaultdict(Aggregate)
     )
     kernels: List[KernelRecord] = field(default_factory=list)
@@ -157,32 +201,126 @@ def classify_distributed_op(
     kernel_name: str,
     op_name: str = "",
     source_file: str = "",
-) -> Optional[DistributedOpKind]:
+) -> Optional[OpKind]:
+    kind = classify_op_kind(kernel_name, op_name, source_file)
+    return kind if is_distributed_kind(kind) else None
+
+
+def is_distributed_kind(kind: OpKind) -> bool:
+    return kind.value.startswith(DISTRIBUTED_PREFIX)
+
+
+def normalized_search_text(
+    kernel_name: str,
+    op_name: str = "",
+    source_file: str = "",
+) -> Tuple[str, str]:
     text = " ".join((kernel_name, op_name, source_file)).lower()
     compact = re.sub(r"[^a-z0-9]+", "", text)
+    return text, compact
 
-    def has_any(*needles: str) -> bool:
-        return any(needle in text or needle.replace("_", "") in compact for needle in needles)
 
-    if has_any("all_reduce", "allreduce", "all-reduce"):
-        return DistributedOpKind.ALL_REDUCE
-    if has_any("reduce_scatter", "reducescatter", "reduce-scatter"):
-        return DistributedOpKind.REDUCE_SCATTER
-    if has_any("all_gather", "allgather", "all-gather"):
-        return DistributedOpKind.ALL_GATHER
-    if has_any("all_to_all", "alltoall", "all-to-all"):
-        return DistributedOpKind.ALL_TO_ALL
-    if has_any("broadcast", "bcast"):
-        return DistributedOpKind.BROADCAST
-    if has_any("sendrecv", "send_recv", "send-recv", "recvsend", "isend", "irecv"):
-        return DistributedOpKind.SEND_RECV
+def has_keyword(text: str, compact: str, *needles: str) -> bool:
+    return any(needle in text or needle.replace("_", "") in compact for needle in needles)
+
+
+def is_flash_attention_internal(text: str, compact: str) -> bool:
+    return any(needle in text or needle.replace("_", "") in compact for needle in FLASH_ATTENTION_EXCLUSIONS)
+
+
+def classify_op_kind(
+    kernel_name: str,
+    op_name: str = "",
+    source_file: str = "",
+) -> OpKind:
+    text, compact = normalized_search_text(kernel_name, op_name, source_file)
+
+    if is_flash_attention_internal(text, compact):
+        return OpKind.ATTENTION
+
+    if has_keyword(text, compact, "all_reduce", "allreduce", "all-reduce"):
+        return OpKind.DISTRIBUTED_ALL_REDUCE
+    if has_keyword(text, compact, "reduce_scatter", "reducescatter", "reduce-scatter"):
+        return OpKind.DISTRIBUTED_REDUCE_SCATTER
+    if has_keyword(text, compact, "all_gather", "allgather", "all-gather"):
+        return OpKind.DISTRIBUTED_ALL_GATHER
+    if has_keyword(text, compact, "all_to_all", "alltoall", "all-to-all"):
+        return OpKind.DISTRIBUTED_ALL_TO_ALL
+    if has_keyword(text, compact, "broadcast", "bcast"):
+        return OpKind.DISTRIBUTED_BROADCAST
+    if has_keyword(text, compact, "sendrecv", "send_recv", "send-recv", "recvsend", "isend", "irecv"):
+        return OpKind.DISTRIBUTED_P2P
     if re.search(r"(^|[^a-z])(send|recv)([^a-z]|$)", text):
-        return DistributedOpKind.SEND_RECV
-    if has_any("barrier"):
-        return DistributedOpKind.BARRIER
-    if "nccl" in text or any(hint in text for hint in DISTRIBUTED_SOURCE_HINTS):
-        return DistributedOpKind.OTHER_DISTRIBUTED
-    return None
+        return OpKind.DISTRIBUTED_P2P
+    if "nccl" in text:
+        return OpKind.DISTRIBUTED_NCCL_OTHER
+    if has_keyword(text, compact, "processgroup", "c10d", "record_param_comms", "custom_ar"):
+        return OpKind.DISTRIBUTED_NCCL_OTHER
+
+    if has_keyword(
+        text,
+        compact,
+        "flash_attn",
+        "flashattn",
+        "attention",
+        "attn",
+        "paged_attention",
+        "sparse_attn",
+        "rotary",
+    ):
+        return OpKind.ATTENTION
+    if has_keyword(text, compact, "moe", "expert", "topk"):
+        return OpKind.MOE
+    if has_keyword(text, compact, "gemm", "matmul", "mm_kernel", "cutlass", "cublas"):
+        return OpKind.GEMM
+    if has_keyword(text, compact, "rms_norm", "rmsnorm", "layer_norm", "layernorm", "l2norm", "norm"):
+        return OpKind.NORM
+    if has_keyword(text, compact, "silu", "gelu", "relu", "activation", "doactivation", "swiglu"):
+        return OpKind.ACTIVATION
+    if has_keyword(text, compact, "kv_cache", "kvcache", "cache_kernel", "reshape_and_cache", "concat_and_cache"):
+        return OpKind.KV_CACHE
+    if has_keyword(text, compact, "index", "gather", "scatter", "sort", "nonzero", "where"):
+        return OpKind.INDEXING
+    if has_keyword(text, compact, "mamba", "linear_attention", "linearattention", "gated_delta"):
+        return OpKind.MAMBA_OR_LINEAR_ATTENTION
+    return OpKind.NON_DISTRIBUTED
+
+
+def detect_distributed_keywords(profile: "ProfileStats") -> List[str]:
+    detected = set()
+    for rank_stat in profile.rank_stats.values():
+        for record in rank_stat.kernels:
+            text, compact = normalized_search_text(record.name, record.op_name, record.source_file)
+            if is_flash_attention_internal(text, compact):
+                continue
+            for keyword in REAL_COMMUNICATION_KEYWORDS:
+                if keyword in text or keyword.replace("_", "") in compact:
+                    detected.add(keyword)
+    return sorted(detected)
+
+
+def has_real_multigpu_communication(profile: "ProfileStats") -> bool:
+    decisive = {
+        "nccl",
+        "all_reduce",
+        "allreduce",
+        "all_gather",
+        "allgather",
+        "reduce_scatter",
+        "reducescatter",
+        "all_to_all",
+        "alltoall",
+    }
+    return any(keyword in decisive for keyword in detect_distributed_keywords(profile))
+
+
+def classify_distributed_op_legacy(
+    kernel_name: str,
+    op_name: str = "",
+    source_file: str = "",
+) -> Optional[OpKind]:
+    """Deprecated compatibility shim for old internal callers."""
+    return classify_distributed_op(kernel_name, op_name, source_file)
 
 
 def open_trace(path: Path) -> Any:
@@ -250,7 +388,7 @@ def parse_trace_file(path: Path, rank: int) -> RankStats:
         kernel_name = normalize_name(str(event.get("name", "unknown")))
         op_name = cpu_op_by_external_id.get(external_key, "")
         source_file = source_by_external_id.get(external_key, "")
-        kind = classify_distributed_op(kernel_name, op_name, source_file)
+        kind = classify_op_kind(kernel_name, op_name, source_file)
         record = KernelRecord(
             rank=rank,
             name=kernel_name,
@@ -261,7 +399,7 @@ def parse_trace_file(path: Path, rank: int) -> RankStats:
         )
         rank_stats.total_kernel_us += float(dur)
         rank_stats.kernels.append(record)
-        if kind is not None:
+        if is_distributed_kind(kind):
             rank_stats.distributed[kind].add(float(dur))
 
     return rank_stats
@@ -331,8 +469,8 @@ def md_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
     return "\n".join(out)
 
 
-def aggregate_distributed(profile: ProfileStats) -> Dict[DistributedOpKind, Aggregate]:
-    out: Dict[DistributedOpKind, Aggregate] = defaultdict(Aggregate)
+def aggregate_distributed(profile: ProfileStats) -> Dict[OpKind, Aggregate]:
+    out: Dict[OpKind, Aggregate] = defaultdict(Aggregate)
     for rank_stat in profile.rank_stats.values():
         for kind, agg in rank_stat.distributed.items():
             out[kind].add(agg.total_us, agg.calls)
@@ -342,8 +480,7 @@ def aggregate_distributed(profile: ProfileStats) -> Dict[DistributedOpKind, Aggr
 def aggregate_records(records: Iterable[KernelRecord]) -> List[Tuple[Tuple[str, str, str, str], Aggregate]]:
     out: Dict[Tuple[str, str, str, str], Aggregate] = defaultdict(Aggregate)
     for record in records:
-        kind = record.kind.value if record.kind else "non_distributed"
-        out[(kind, record.op_name, record.name, record.source_file)].add(record.dur_us)
+        out[(record.kind.value, record.op_name, record.name, record.source_file)].add(record.dur_us)
     return sorted(out.items(), key=lambda item: item[1].total_us, reverse=True)
 
 
@@ -366,6 +503,23 @@ def build_markdown(profile: ProfileStats, rank_selector: str) -> Tuple[str, List
     lines.append(md_table(["字段", "值"], overview_rows))
     lines.append("")
     tables.append({"sheet_name": "Overview", "headers": ["字段", "值"], "rows": overview_rows})
+
+    detected_keywords = detect_distributed_keywords(profile)
+    ranks = sorted(profile.rank_stats)
+    sanity_note = ""
+    if len(ranks) == 1 and not has_real_multigpu_communication(profile):
+        sanity_note = "当前 profile 未检测到真实多卡通信，可能是 TP=1 smoke test"
+    sanity_rows = [
+        ["trace files", "\n".join(str(path) for path in profile.trace_files)],
+        ["ranks", ",".join(str(rank) for rank in ranks)],
+        ["detected distributed keywords", ", ".join(detected_keywords) if detected_keywords else "none"],
+        ["sanity note", sanity_note or "ok"],
+    ]
+    lines.append("## Sanity Check")
+    lines.append("")
+    lines.append(md_table(["字段", "值"], sanity_rows))
+    lines.append("")
+    tables.append({"sheet_name": "SanityCheck", "headers": ["字段", "值"], "rows": sanity_rows})
 
     dist_agg = aggregate_distributed(profile)
     dist_rows: List[List[str]] = []
@@ -420,7 +574,7 @@ def build_markdown(profile: ProfileStats, rank_selector: str) -> Tuple[str, List
     })
 
     all_records = [record for stat in profile.rank_stats.values() for record in stat.kernels]
-    distributed_records = [record for record in all_records if record.kind is not None]
+    distributed_records = [record for record in all_records if is_distributed_kind(record.kind)]
     dist_kernel_rows: List[List[str]] = []
     for (kind, op_name, kernel_name, source_file), agg in aggregate_records(distributed_records)[:200]:
         dist_kernel_rows.append([

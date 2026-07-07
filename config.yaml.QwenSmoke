@@ -1,0 +1,32 @@
+model:
+  path: /data/guoyihao/flagtree/workspace/tmp/Qwen
+  name: QwenSmoke
+  tensor_parallel_size: 1
+  tokenizer_path: /data/guoyihao/flagtree/workspace/tmp/Qwen
+
+serve:
+  trust_remote_code: true
+  extra_args: ""
+
+sglang:
+  dtype: bfloat16
+  mem_fraction_static: 0.30
+  extra_args: "--skip-server-warmup --max-total-tokens 2048"
+
+benchmark:
+  dataset_name: random
+  dataset_path: /data/yangkw/datasets/sharegpt_synthetic_2048.json
+  host: 127.0.0.1
+  port_base: 30100
+  num_runs: 2
+  scenarios:
+    optimized:
+      - name: p128d16
+        input_len: 128
+        output_len: 16
+        concurrency: 2
+
+paths:
+  results: /data/yangkw/outputs/flagostune_results
+  reports: /data/yangkw/outputs/flagostune_reports
+  use_model_name: true

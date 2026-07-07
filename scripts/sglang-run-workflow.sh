@@ -128,6 +128,7 @@ update_tool_config() {
     paths_results=$(yq '.paths.results // "results"' "$CONFIG_FILE")
     paths_reports=$(yq '.paths.reports // "reports"' "$CONFIG_FILE")
     paths_use_model_name=$(yq '.paths.use_model_name // true' "$CONFIG_FILE")
+
     if [[ "$paths_use_model_name" == "true" ]]; then
         path_prefix="${paths_results}/${model_name}"
         report_prefix="${paths_reports}/${model_name}"
@@ -139,8 +140,10 @@ update_tool_config() {
     log_dir="${path_prefix}/sglang-bench_${SCENARIO_TYPE}_torch_profile_log/sglang_bench_logs"
     torch_output_dir="${path_prefix}/sglang-torch-raw"
     reports_dir="${report_prefix}"
+
     benchmark_host=$(yq '.benchmark.host // "127.0.0.1"' "$CONFIG_FILE")
     benchmark_num_runs=$(yq '.benchmark.num_runs // 2' "$CONFIG_FILE")
+
     if [[ -n "$RUNS_OVERRIDE" ]]; then
         benchmark_num_runs="$RUNS_OVERRIDE"
     elif (( benchmark_num_runs < 2 )); then
@@ -148,18 +151,26 @@ update_tool_config() {
         log_warn "SGLang torch profiling 至少运行 2 轮，已将 benchmark.num_runs 调整为 2"
     fi
 
-    yq -i ".current_run.device = ${DEVICE}" "$TOOL_CONFIG"
+    yq -i ".current_run.device = \"${DEVICE}\"" "$TOOL_CONFIG"
     yq -i ".current_run.scenario_type = \"${SCENARIO_TYPE}\"" "$TOOL_CONFIG"
     yq -i ".current_run.torch_profile = true" "$TOOL_CONFIG"
+
     yq -i ".model.path = \"${model_path}\"" "$TOOL_CONFIG"
     yq -i ".model.name = \"${model_name}\"" "$TOOL_CONFIG"
     yq -i ".model.tokenizer_path = \"${tokenizer_path}\"" "$TOOL_CONFIG"
     yq -i ".model.tensor_parallel_size = ${tensor_parallel}" "$TOOL_CONFIG"
+
     yq -i ".serve = $(yq '.serve // {}' "$CONFIG_FILE" -o=json)" "$TOOL_CONFIG"
     yq -i ".sglang = $(yq '.sglang // {}' "$CONFIG_FILE" -o=json)" "$TOOL_CONFIG"
+
+    # 关键修复：完整复制 benchmark，避免 dataset_name / dataset_path 丢失
+    yq -i ".benchmark = $(yq '.benchmark // {}' "$CONFIG_FILE" -o=json)" "$TOOL_CONFIG"
+
+    # 再覆盖 workflow 运行时控制字段
     yq -i ".benchmark.host = \"${benchmark_host}\"" "$TOOL_CONFIG"
     yq -i ".benchmark.num_runs = ${benchmark_num_runs}" "$TOOL_CONFIG"
     yq -i ".benchmark.scenarios = $(yq '.benchmark.scenarios' "$CONFIG_FILE" -o=json)" "$TOOL_CONFIG"
+
     yq -i ".paths.results = \"${paths_results}\"" "$TOOL_CONFIG"
     yq -i ".paths.reports = \"${paths_reports}\"" "$TOOL_CONFIG"
     yq -i ".paths.use_model_name = ${paths_use_model_name}" "$TOOL_CONFIG"

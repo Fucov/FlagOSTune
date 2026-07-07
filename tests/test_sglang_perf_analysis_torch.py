@@ -5,7 +5,10 @@ from pathlib import Path
 
 from scripts.tools.sglang_perf_analysis_torch import (
     DistributedOpKind,
+    OpKind,
+    build_markdown,
     classify_distributed_op,
+    classify_op_kind,
     extract_rank,
     parse_profile_dir_by_rank,
 )
@@ -46,33 +49,61 @@ class SGLangPerfAnalysisTorchTest(unittest.TestCase):
     def test_classify_distributed_op_covers_common_collectives(self) -> None:
         self.assertEqual(
             classify_distributed_op("ncclDevKernel_AllReduce_RING_LL", ""),
-            DistributedOpKind.ALL_REDUCE,
+            DistributedOpKind.DISTRIBUTED_ALL_REDUCE,
         )
         self.assertEqual(
             classify_distributed_op("ncclDevKernel_AllGather_RING_LL", ""),
-            DistributedOpKind.ALL_GATHER,
+            DistributedOpKind.DISTRIBUTED_ALL_GATHER,
         )
         self.assertEqual(
             classify_distributed_op("ncclDevKernel_ReduceScatter_RING_LL", ""),
-            DistributedOpKind.REDUCE_SCATTER,
+            DistributedOpKind.DISTRIBUTED_REDUCE_SCATTER,
         )
         self.assertEqual(
             classify_distributed_op("ncclDevKernel_AllToAll", ""),
-            DistributedOpKind.ALL_TO_ALL,
+            DistributedOpKind.DISTRIBUTED_ALL_TO_ALL,
         )
         self.assertEqual(
             classify_distributed_op("void ncclBroadcastKernel", ""),
-            DistributedOpKind.BROADCAST,
+            DistributedOpKind.DISTRIBUTED_BROADCAST,
         )
         self.assertEqual(
             classify_distributed_op("ncclKernel_SendRecv", ""),
-            DistributedOpKind.SEND_RECV,
-        )
-        self.assertEqual(
-            classify_distributed_op("sglang::barrier_wait", ""),
-            DistributedOpKind.BARRIER,
+            DistributedOpKind.DISTRIBUTED_P2P,
         )
         self.assertIsNone(classify_distributed_op("sglang::launch_attention", ""))
+
+    def test_classify_op_kind_keeps_cutlass_flash_attention_non_distributed(self) -> None:
+        flash_kernel = "cutlass::device_kernel<flash::FlashAttnFwdSm90<CollectiveMainloopFwdSm90, CollectiveEpilogueFwd>>"
+        self.assertEqual(classify_op_kind(flash_kernel, ""), OpKind.ATTENTION)
+        self.assertIsNone(classify_distributed_op(flash_kernel, ""))
+        self.assertEqual(classify_op_kind("flash::prepare_varlen_num_blocks_kernel", ""), OpKind.ATTENTION)
+
+    def test_classify_op_kind_covers_requested_distributed_variants(self) -> None:
+        self.assertEqual(
+            classify_op_kind("ncclDevKernel_AllReduce_RING_LL", ""),
+            OpKind.DISTRIBUTED_ALL_REDUCE,
+        )
+        self.assertEqual(
+            classify_op_kind("some_kernel", "torch.ops._C_custom_ar::all_reduce"),
+            OpKind.DISTRIBUTED_ALL_REDUCE,
+        )
+        self.assertEqual(
+            classify_op_kind("ncclDevKernel_AllGather_RING_LL", ""),
+            OpKind.DISTRIBUTED_ALL_GATHER,
+        )
+        self.assertEqual(
+            classify_op_kind("sglang_reduce_scatter_kernel", ""),
+            OpKind.DISTRIBUTED_REDUCE_SCATTER,
+        )
+        self.assertEqual(
+            classify_op_kind("sglang::all_to_all_kernel", ""),
+            OpKind.DISTRIBUTED_ALL_TO_ALL,
+        )
+        self.assertEqual(
+            classify_op_kind("sglang::alltoall_kernel", ""),
+            OpKind.DISTRIBUTED_ALL_TO_ALL,
+        )
 
     def test_extract_rank_handles_sglang_and_torch_profiler_names(self) -> None:
         self.assertEqual(extract_rank(Path("worker-rank0.pt.trace.json")), 0)
@@ -104,11 +135,33 @@ class SGLangPerfAnalysisTorchTest(unittest.TestCase):
             profile = parse_profile_dir_by_rank(report_dir, rank_selector="all")
 
         self.assertEqual(sorted(profile.rank_stats.keys()), [0, 1])
-        self.assertEqual(profile.rank_stats[0].distributed[DistributedOpKind.ALL_REDUCE].calls, 1)
-        self.assertEqual(profile.rank_stats[0].distributed[DistributedOpKind.ALL_REDUCE].total_us, 30.0)
-        self.assertEqual(profile.rank_stats[1].distributed[DistributedOpKind.ALL_REDUCE].total_us, 50.0)
-        self.assertEqual(profile.rank_stats[1].distributed[DistributedOpKind.ALL_GATHER].total_us, 20.0)
+        self.assertEqual(profile.rank_stats[0].distributed[DistributedOpKind.DISTRIBUTED_ALL_REDUCE].calls, 1)
+        self.assertEqual(profile.rank_stats[0].distributed[DistributedOpKind.DISTRIBUTED_ALL_REDUCE].total_us, 30.0)
+        self.assertEqual(profile.rank_stats[1].distributed[DistributedOpKind.DISTRIBUTED_ALL_REDUCE].total_us, 50.0)
+        self.assertEqual(profile.rank_stats[1].distributed[DistributedOpKind.DISTRIBUTED_ALL_GATHER].total_us, 20.0)
         self.assertEqual(profile.total_kernel_us, 170.0)
+
+    def test_tp1_flash_attention_report_has_zero_distributed_and_sanity_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report-sglang"
+            report_dir.mkdir()
+            write_trace(
+                report_dir / "worker-rank0.pt.trace.json",
+                [
+                    kernel_event(
+                        "cutlass::device_kernel<flash::FlashAttnFwdSm90<CollectiveMainloopFwdSm90, CollectiveEpilogueFwd>>",
+                        120.0,
+                    ),
+                ],
+            )
+
+            profile = parse_profile_dir_by_rank(report_dir, rank_selector="all")
+            markdown, _ = build_markdown(profile, "all")
+
+        self.assertEqual(profile.distributed_total_us, 0.0)
+        self.assertIn("distributed kernel time(ms) | 0.000", markdown)
+        self.assertIn("当前 profile 未检测到真实多卡通信，可能是 TP=1 smoke test", markdown)
+        self.assertIn("attention", markdown)
 
     def test_parse_profile_dir_by_rank_filters_single_rank(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
