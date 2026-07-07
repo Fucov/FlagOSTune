@@ -199,12 +199,10 @@ patch_sglang_compat() {
         return 0
     fi
 
-    local model_path model_name model_key
-    model_path=$(yq '.model.path // ""' "$TOOL_CONFIG")
-    model_name=$(yq '.model.name // ""' "$TOOL_CONFIG")
-    model_key="$(printf '%s %s' "$model_path" "$model_name" | tr '[:upper:]' '[:lower:]')"
-    if [[ "$model_key" != *"qwen3"* ]]; then
-        log_info "非 Qwen3 模型，跳过 SGLang Qwen3 vision_config 兼容补丁"
+    local apply_patch
+    apply_patch=$(yq '.sglang.apply_qwen3_vision_config_patch // false' "$TOOL_CONFIG")
+    if [[ "$apply_patch" != "true" ]]; then
+        log_info "未启用 SGLang Qwen3 vision_config 兼容补丁"
         return 0
     fi
 

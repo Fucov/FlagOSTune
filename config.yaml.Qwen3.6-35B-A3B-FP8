@@ -6,11 +6,11 @@
 # ===================
 model:
   # 模型路径
-  path: /models/Qwen3.6-35B-A3B-FP8
+  path: /data/models/Qwen3.6-35B-A3B-FP8
   # 服务名称 (用于 vllm serve --served-model-name)
   name: Qwen3.6-35B-A3B-FP8
   # 张量并行大小
-  tensor_parallel_size: 1
+  tensor_parallel_size: 4
   # Tokenizer 路径 (默认与 model.path 相同)
   tokenizer_path: null  # null 表示使用 model.path
 
@@ -32,9 +32,21 @@ serve:
   extra_args: "--max-model-len 65536 --no-enable-prefix-caching"
 
 # ===================
+# SGLang profiling 配置
+# ===================
+sglang:
+  dtype: bfloat16
+  mem_fraction_static: 0.80
+  context_length: 65536
+  load_format: auto
+  extra_args: "--skip-server-warmup --max-total-tokens 65536"
+
+# ===================
 # 基准测试配置
 # ===================
 benchmark:
+  dataset_name: random
+  dataset_path: /data/yangkw/datasets/sharegpt_synthetic_2048.json
   # 主机地址
   host: 127.0.0.1
   # 端口基数 (实际端口 = port_base + device)
@@ -160,9 +172,9 @@ target_ops:
 # ===================
 paths:
   # 结果目录根路径 (实际路径: {results}/{model.name}/)
-  results: results
+  results: /data/yangkw/outputs/flagostune_results
   # 报告目录根路径 (实际路径: {reports}/{model.name}/)
-  reports: reports
+  reports: /data/yangkw/outputs/flagostune_reports
   # Gems 配置目录
   gems_config: gems-config
   # 处理脚本目录

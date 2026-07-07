@@ -1,8 +1,8 @@
 model:
-  path: /data/models/Qwen3.6-35B-A3B-FP8
-  name: Qwen3.6-35B-A3B-FP8-Smoke
+  path: /data/models/DeepSeek-V4-Flash
+  name: DeepSeek-V4-Flash-Smoke
   tensor_parallel_size: 1
-  tokenizer_path: /data/models/Qwen3.6-35B-A3B-FP8
+  tokenizer_path: /data/models/DeepSeek-V4-Flash
 
 serve:
   trust_remote_code: true

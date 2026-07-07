@@ -6,7 +6,7 @@
 # ===================
 model:
   # 模型路径
-  path: /models/DeepSeek-V4-Flash
+  path: /data/models/DeepSeek-V4-Flash
   # 服务名称 (用于 vllm serve --served-model-name)
   name: DeepSeek-V4-Flash
   # 张量并行大小
@@ -33,11 +33,22 @@ serve:
   # 额外参数 (将直接传递给 vllm serve)
   extra_args: "--kv_cache_dtype fp8 --max-model-len 65536 --no-enable-prefix-caching"
 
+# ===================
+# SGLang profiling 配置
+# ===================
+sglang:
+  dtype: bfloat16
+  mem_fraction_static: 0.80
+  context_length: 65536
+  load_format: auto
+  extra_args: "--skip-server-warmup --max-total-tokens 65536"
 
 # ===================
 # 基准测试配置
 # ===================
 benchmark:
+  dataset_name: random
+  dataset_path: /data/yangkw/datasets/sharegpt_synthetic_2048.json
   # 主机地址
   host: 127.0.0.1
   # 端口基数 (实际端口 = port_base + device)
@@ -163,9 +174,9 @@ target_ops:
 # ===================
 paths:
   # 结果目录根路径 (实际路径: {results}/{model.name}/)
-  results: results
+  results: /data/yangkw/outputs/flagostune_results
   # 报告目录根路径 (实际路径: {reports}/{model.name}/)
-  reports: reports
+  reports: /data/yangkw/outputs/flagostune_reports
   # Gems 配置目录
   gems_config: gems-config
   # 处理脚本目录
