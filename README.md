@@ -266,3 +266,118 @@ Gems Shape 场景 MM pretune 性能测试
 - FlagGems pretune 性能测试
 
 使用时可直接参考脚本中的命令顺序，按需手动执行，或将其作为日常回归测试的参考清单。
+
+---
+
+## 7. SGLang 多卡分布式算子 Torch Profiler
+
+本流程用于分析 SGLang 原生执行路径下的多卡分布式算子使用情况，重点关注 NCCL / collective / distributed kernel，例如 `all_reduce`、`all_gather`、`reduce_scatter`、`all_to_all`、`broadcast`、`send/recv`、`barrier` 等。
+
+说明：
+
+- `--model` 仍然表示模型配置文件后缀，例如 `--model DeepSeek-V4-Flash` 会读取 `config.yaml.DeepSeek-V4-Flash`。
+- 这是 SGLang native 单侧 profile，不分析 FlagGems 替换效果，也不做 CUDA/GEMS 对比。
+- 采集方式采用 SGLang offline throughput profiling，更接近当前 vLLM `--torch` 的内置引擎 profiling 模式。
+- 原有 vLLM 脚本不需要改动；SGLang 使用新增的 `sglang-*` 脚本。
+
+### 7.1 可选 SGLang 配置
+
+模型配置仍复用现有字段：
+
+- `model.path`
+- `model.name`
+- `model.tensor_parallel_size`
+- `model.tokenizer_path`
+- `serve.trust_remote_code`
+- `benchmark.num_runs`
+- `benchmark.scenarios`
+- `paths.results`
+- `paths.reports`
+
+如需传递 SGLang 专用参数，可在对应 `config.yaml.<模型名>` 中增加可选字段：
+
+```yaml
+sglang:
+  extra_args: "--mem-fraction-static 0.82 --attention-backend flashinfer"
+```
+
+如果没有配置 `sglang.extra_args`，runner 会回退使用 `serve.extra_args`。如果 vLLM 和 SGLang 参数不兼容，建议显式配置 `sglang.extra_args`。
+
+### 7.2 采集 SGLang Torch Profiler
+
+DeepSeek 示例：
+
+```bash
+./scripts/sglang-auto-workflow.sh --model DeepSeek-V4-Flash --device 0 --torch --scenario optimized
+```
+
+Qwen 示例：
+
+```bash
+./scripts/sglang-auto-workflow.sh --model Qwen3.5-397B-A17B --device 0 --torch --scenario optimized
+```
+
+覆盖运行轮数：
+
+```bash
+./scripts/sglang-auto-workflow.sh --model DeepSeek-V4-Flash --device 0 --torch --scenario optimized --runs 2
+```
+
+Dry run 只打印将执行的 SGLang 命令，不启动模型：
+
+```bash
+./scripts/sglang-auto-workflow.sh --model DeepSeek-V4-Flash --device 0 --torch --scenario optimized --dry-run
+```
+
+采集逻辑：
+
+- 每个 scenario 会运行 `benchmark.num_runs` 轮。
+- 最后一轮启用 profiler，前面的轮次用于预热。
+- profiler 目录通过 `SGLANG_TORCH_PROFILER_DIR` 传给 SGLang。
+
+原始输出默认保存到：
+
+```bash
+results/<model>/sglang-bench_<scenario>_torch_profile_log/sglang_bench_logs/
+results/<model>/sglang-torch-raw/report-sglang/
+```
+
+### 7.3 生成分布式算子报告
+
+分析 rank 0：
+
+```bash
+./scripts/sglang-auto-processing.sh --model DeepSeek-V4-Flash --workflow torch --rank 0
+```
+
+分析全部 rank：
+
+```bash
+./scripts/sglang-auto-processing.sh --model DeepSeek-V4-Flash --workflow torch --rank all
+```
+
+生成文件：
+
+```bash
+reports/<model>/sglang_perf_analysis_torch.md
+reports/<model>/sglang_perf_analysis_torch.xlsx
+```
+
+报告包含：
+
+- Profile 概览：trace 文件数、rank 列表、总 kernel 时间、分布式 kernel 时间与占比。
+- 分布式算子总览：按 `all_reduce`、`all_gather`、`reduce_scatter` 等类型聚合调用次数和耗时。
+- 按 Rank 对比：展示每类分布式算子在各 rank 上的耗时、调用次数和 `max/min` 不均衡比例。
+- Top 分布式 Kernel：列出耗时最高的分布式 kernel、关联 op 和 source 信息。
+- Top 全部 Kernel：保留整体 kernel 视角，便于判断通信与计算占比。
+
+### 7.4 静态检查
+
+代码变更后可先做静态检查：
+
+```bash
+bash -n scripts/sglang-auto-workflow.sh scripts/sglang-run-workflow.sh scripts/sglang-auto-processing.sh scripts/sglang-run-processing.sh
+python3 -m py_compile scripts/tools/sglang_profile_runner.py scripts/tools/sglang_perf_analysis_torch.py
+```
+
+服务器具备 SGLang 环境后，再执行采集与分析命令。
