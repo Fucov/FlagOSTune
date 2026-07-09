@@ -1,0 +1,35 @@
+current_run:
+  device: 4,5,6,7
+  scenario_type: optimized
+  torch_profile: true
+model:
+  path: /data/models/Qwen3.6-35B-A3B-FP8
+  name: Qwen3.6-35B-A3B-FP8-TP4-P32768D1024C1
+  tokenizer_path: /data/models/Qwen3.6-35B-A3B-FP8
+  tensor_parallel_size: 4
+serve: {}
+sglang:
+  context_length: 65536
+  mem_fraction_static: 0.80
+  load_format: auto
+  trust_remote_code: true
+  extra_args: --disable-cuda-graph --attention-backend triton --sampling-backend pytorch --watchdog-timeout 3600 --max-running-requests 2048 --chunked-prefill-size 16384 --max-prefill-tokens 16384 --port 30001 --nccl-port 29501
+benchmark:
+  dataset_name: sharegpt
+  dataset_path: /data/yangkw/datasets/qwen_controlled/p32768d1024_c1.json
+  num_runs: 2
+  scenarios:
+    optimized:
+      - name: p32768d1024_c1
+        input_len: 32768
+        output_len: 1024
+        concurrency: 1
+  host: 127.0.0.1
+paths:
+  results: results
+  reports: reports
+  use_model_name: true
+  log_dir: results/Qwen3.6-35B-A3B-FP8-TP4-P32768D1024C1/sglang-bench_optimized_torch_profile_log/sglang_bench_logs
+  torch_output_dir: results/Qwen3.6-35B-A3B-FP8-TP4-P32768D1024C1/sglang-torch-raw
+  reports_dir: reports/Qwen3.6-35B-A3B-FP8-TP4-P32768D1024C1
+  model_name: Qwen3.6-35B-A3B-FP8-TP4-P32768D1024C1

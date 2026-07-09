@@ -1,0 +1,32 @@
+model:
+  name: Qwen3.6-35B-A3B-FP8-TP4-Tiny
+  path: /data/models/Qwen3.6-35B-A3B-FP8
+  tokenizer_path: /data/models/Qwen3.6-35B-A3B-FP8
+  tensor_parallel_size: 4
+
+runtime:
+  backend: sglang
+  device: cuda
+  dtype: bfloat16
+
+sglang:
+  context_length: 4096
+  mem_fraction_static: 0.6
+  load_format: auto
+  trust_remote_code: true
+  extra_args: "--disable-cuda-graph --attention-backend triton --sampling-backend pytorch --watchdog-timeout 1800 --max-running-requests 1 --chunked-prefill-size 512 --max-prefill-tokens 512 --port 30001 --nccl-port 29501"
+
+benchmark:
+  dataset_name: sharegpt
+  dataset_path: /data/yangkw/datasets/sharegpt_tiny_128_16.json
+  num_runs: 2
+  scenarios:
+    optimized:
+      - name: p26d12_c1
+        input_len: 128
+        output_len: 16
+        concurrency: 1
+
+output:
+  result_dir: /data/yangkw/outputs/flagostune_results
+  report_dir: /data/yangkw/outputs/flagostune_reports

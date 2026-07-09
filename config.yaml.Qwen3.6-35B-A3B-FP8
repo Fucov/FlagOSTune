@@ -39,7 +39,7 @@ sglang:
   mem_fraction_static: 0.80
   context_length: 65536
   load_format: auto
-  extra_args: "--skip-server-warmup --max-total-tokens 65536"
+  extra_args: "--skip-server-warmup --max-total-tokens 65536 --disable-cuda-graph --attention-backend triton"
 
 # ===================
 # 基准测试配置
