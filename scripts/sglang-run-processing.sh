@@ -24,6 +24,9 @@ MODEL_CONFIG=""
 WORKFLOW="torch"
 RANK="0"
 WORKERS=""
+PROGRESS_EVERY=""
+MAX_EVENTS=""
+NO_XLSX="false"
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -43,6 +46,18 @@ parse_args() {
             --workers)
                 WORKERS="$2"
                 shift 2
+                ;;
+            --progress-every)
+                PROGRESS_EVERY="$2"
+                shift 2
+                ;;
+            --max-events)
+                MAX_EVENTS="$2"
+                shift 2
+                ;;
+            --no-xlsx)
+                NO_XLSX="true"
+                shift
                 ;;
             -h|--help)
                 head -4 "$0" | tail -2
@@ -123,9 +138,18 @@ run_analyzer() {
     if [[ -n "$WORKERS" ]]; then
         args+=("--workers" "$WORKERS")
     fi
+    if [[ -n "$PROGRESS_EVERY" ]]; then
+        args+=("--progress-every" "$PROGRESS_EVERY")
+    fi
+    if [[ -n "$MAX_EVENTS" ]]; then
+        args+=("--max-events" "$MAX_EVENTS")
+    fi
+    if [[ "$NO_XLSX" == "true" ]]; then
+        args+=("--no-xlsx")
+    fi
 
     cd "$PROJECT_ROOT"
-    "$Python_EXECUTABLE" "${SCRIPT_DIR}/tools/sglang_perf_analysis_torch.py" "${args[@]}"
+    PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}" "$Python_EXECUTABLE" "${SCRIPT_DIR}/tools/sglang_perf_analysis_torch.py" "${args[@]}"
 }
 
 main() {

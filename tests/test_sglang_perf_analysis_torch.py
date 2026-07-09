@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +13,7 @@ from scripts.tools.sglang_perf_analysis_torch import (
     classify_distributed_op,
     classify_op_kind,
     extract_rank,
+    iter_trace_events,
     parse_profile_dir_by_rank,
 )
 
@@ -42,6 +46,21 @@ def cpu_op_event(name: str, external_id: int) -> dict:
         "dur": 1.0,
         "tid": 7,
         "args": {"External id": external_id},
+    }
+
+
+def profiler_event(name: str, cat: str, dur: float, external_id: int | None = None) -> dict:
+    args = {}
+    if external_id is not None:
+        args["External id"] = external_id
+    return {
+        "ph": "X",
+        "cat": cat,
+        "name": name,
+        "ts": 2.0,
+        "dur": dur,
+        "tid": 7,
+        "args": args,
     }
 
 
@@ -174,6 +193,72 @@ class SGLangPerfAnalysisTorchTest(unittest.TestCase):
 
         self.assertEqual(sorted(profile.rank_stats.keys()), [1])
         self.assertEqual(profile.total_kernel_us, 50.0)
+
+    def test_iter_trace_events_streams_plain_json_trace_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / "worker-rank0.pt.trace.json"
+            write_trace(trace, [kernel_event("kernel_a", 1.0), kernel_event("kernel_b", 2.0)])
+
+            names = [event["name"] for event in iter_trace_events(trace)]
+
+        self.assertEqual(names, ["kernel_a", "kernel_b"])
+
+    def test_markdown_separates_gpu_kernels_from_profiler_hotspots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report-sglang"
+            report_dir.mkdir()
+            write_trace(
+                report_dir / "worker-rank0.pt.trace.json",
+                [
+                    cpu_op_event("aten::mm", 1),
+                    profiler_event("sglang.forward", "python_function", 500.0, 1),
+                    profiler_event("Model.layers.0", "nn_module", 400.0, 1),
+                    kernel_event("void cutlass_gemm_kernel", 80.0, 1),
+                ],
+            )
+
+            profile = parse_profile_dir_by_rank(
+                report_dir,
+                rank_selector="0",
+                progress_every=0,
+                use_cache=False,
+            )
+            markdown, _ = build_markdown(profile, "0", model_name="Qwen3.6-35B-A3B-FP8-TP4-P32768D1024C1")
+
+        kernel_section = markdown.split("## Profiler Event 热点", 1)[0]
+        self.assertIn("void cutlass_gemm_kernel", kernel_section)
+        self.assertNotIn("sglang.forward", kernel_section)
+        self.assertIn("## Profiler Event 热点（按总时间排序）", markdown)
+        self.assertIn("sglang.forward", markdown)
+        self.assertIn("FlagOSTune Torch Profiling 之 SGLang Qwen3.6-35B-A3B-FP8 TP4", markdown)
+
+    def test_parse_profile_dir_by_rank_reuses_cache_when_trace_metadata_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report_dir = root / "report-sglang"
+            output_dir = root / "reports" / "model"
+            report_dir.mkdir()
+            write_trace(report_dir / "worker-rank0.pt.trace.json", [kernel_event("ncclDevKernel_AllReduce", 30.0)])
+
+            first = parse_profile_dir_by_rank(
+                report_dir,
+                rank_selector="0",
+                output_dir=output_dir,
+                progress_every=0,
+            )
+            cache_file = output_dir / "cache" / "rank0_kernel_agg.json"
+            self.assertTrue(cache_file.exists())
+            first_mtime = os.path.getmtime(cache_file)
+
+            second = parse_profile_dir_by_rank(
+                report_dir,
+                rank_selector="0",
+                output_dir=output_dir,
+                progress_every=0,
+            )
+
+            self.assertEqual(first.total_kernel_us, second.total_kernel_us)
+            self.assertEqual(first_mtime, os.path.getmtime(cache_file))
 
 
 if __name__ == "__main__":

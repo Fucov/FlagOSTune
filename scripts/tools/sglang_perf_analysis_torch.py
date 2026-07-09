@@ -8,13 +8,18 @@ import gzip
 import json
 import math
 import re
+import sys
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, DefaultDict, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
-import yaml
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    yaml = None
 
 try:
     from openpyxl import Workbook
@@ -116,7 +121,17 @@ class KernelRecord:
 class RankStats:
     rank: int
     total_kernel_us: float = 0.0
+    parsed_events: int = 0
+    gpu_kernel_events: int = 0
+    profiler_events: int = 0
+    distributed_events: int = 0
     distributed: DefaultDict[OpKind, Aggregate] = field(
+        default_factory=lambda: defaultdict(Aggregate)
+    )
+    kernel_aggs: DefaultDict[Tuple[str, str, str, str], Aggregate] = field(
+        default_factory=lambda: defaultdict(Aggregate)
+    )
+    event_hotspots: DefaultDict[Tuple[str, str, str], Aggregate] = field(
         default_factory=lambda: defaultdict(Aggregate)
     )
     kernels: List[KernelRecord] = field(default_factory=list)
@@ -128,6 +143,7 @@ class ProfileStats:
     trace_files: List[Path]
     total_kernel_us: float
     profiler_txt_total_us: float
+    cache_dir: Optional[Path] = None
 
     @property
     def distributed_total_us(self) -> float:
@@ -144,7 +160,7 @@ def get_project_root() -> Path:
 
 def load_tool_config() -> Dict[str, Any]:
     cfg = get_project_root() / "scripts" / "tools" / "sglang_tool_config.yaml"
-    if not cfg.exists():
+    if not cfg.exists() or yaml is None:
         return {}
     return yaml.safe_load(cfg.read_text(encoding="utf-8")) or {}
 
@@ -296,6 +312,13 @@ def detect_distributed_keywords(profile: "ProfileStats") -> List[str]:
             for keyword in REAL_COMMUNICATION_KEYWORDS:
                 if keyword in text or keyword.replace("_", "") in compact:
                     detected.add(keyword)
+        for kind, op_name, kernel_name, source_file in rank_stat.kernel_aggs:
+            text, compact = normalized_search_text(kernel_name, op_name, source_file)
+            if is_flash_attention_internal(text, compact):
+                continue
+            for keyword in REAL_COMMUNICATION_KEYWORDS:
+                if keyword in text or keyword.replace("_", "") in compact:
+                    detected.add(keyword)
     return sorted(detected)
 
 
@@ -325,15 +348,88 @@ def classify_distributed_op_legacy(
 
 def open_trace(path: Path) -> Any:
     if path.suffix == ".gz":
-        return gzip.open(path, "rt", encoding="utf-8", errors="ignore")
-    return path.open("r", encoding="utf-8", errors="ignore")
+        return gzip.open(path, "rb")
+    return path.open("rb")
+
+
+def iter_trace_event_objects(path: Path, chunk_size: int = 8 * 1024 * 1024) -> Iterator[bytes]:
+    """Stream Chrome trace event JSON objects from traceEvents without loading the file."""
+    marker = b'"traceEvents"'
+    buf = b""
+    in_events = False
+    in_obj = False
+    obj = bytearray()
+    depth = 0
+    in_str = False
+    esc = False
+
+    with open_trace(path) as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+
+            if not in_events:
+                buf += chunk
+                pos = buf.find(marker)
+                if pos < 0:
+                    if len(buf) > len(marker) + 1024:
+                        buf = buf[-(len(marker) + 1024):]
+                    continue
+
+                arr = buf.find(b"[", pos)
+                if arr < 0:
+                    buf = buf[pos:]
+                    continue
+
+                data = buf[arr + 1:]
+                buf = b""
+                in_events = True
+            else:
+                data = chunk
+
+            for c in data:
+                if not in_obj:
+                    if c == ord("{"):
+                        in_obj = True
+                        obj = bytearray()
+                        obj.append(c)
+                        depth = 1
+                        in_str = False
+                        esc = False
+                    elif c == ord("]"):
+                        return
+                    continue
+
+                obj.append(c)
+
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif c == ord("\\"):
+                        esc = True
+                    elif c == ord('"'):
+                        in_str = False
+                    continue
+
+                if c == ord('"'):
+                    in_str = True
+                elif c == ord("{"):
+                    depth += 1
+                elif c == ord("}"):
+                    depth -= 1
+                    if depth == 0:
+                        yield bytes(obj)
+                        in_obj = False
+                        obj = bytearray()
 
 
 def iter_trace_events(path: Path) -> Iterable[Dict[str, Any]]:
-    with open_trace(path) as f:
-        data = json.load(f)
-    events = data.get("traceEvents", []) if isinstance(data, dict) else []
-    for event in events:
+    for obj in iter_trace_event_objects(path):
+        try:
+            event = json.loads(obj)
+        except json.JSONDecodeError:
+            continue
         if isinstance(event, dict):
             yield event
 
@@ -356,68 +452,226 @@ def parse_self_cuda_total_us(txt_path: Path) -> float:
     return 0.0
 
 
-def parse_trace_file(path: Path, rank: int) -> RankStats:
+def trace_metadata(path: Path) -> Dict[str, Any]:
+    stat = path.stat()
+    return {
+        "path": str(path),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def cache_paths(output_dir: Optional[Path], rank: int) -> Tuple[Optional[Path], Optional[Path]]:
+    if output_dir is None:
+        return None, None
+    cache_dir = output_dir / "cache"
+    return cache_dir / f"rank{rank}_kernel_agg.json", cache_dir / f"rank{rank}_event_hotspot_agg.json"
+
+
+def serialize_aggregate_map(data: Dict[Tuple[str, ...], Aggregate]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for key, agg in data.items():
+        rows.append({"key": list(key), "calls": agg.calls, "total_us": agg.total_us})
+    return rows
+
+
+def load_aggregate_map(rows: Iterable[Dict[str, Any]]) -> DefaultDict[Tuple[str, ...], Aggregate]:
+    out: DefaultDict[Tuple[str, ...], Aggregate] = defaultdict(Aggregate)
+    for row in rows:
+        key = tuple(str(item) for item in row.get("key", []))
+        if not key:
+            continue
+        out[key].add(float(row.get("total_us", 0.0)), int(row.get("calls", 0)))
+    return out
+
+
+def load_rank_stats_from_cache(path: Path, rank: int, kernel_cache: Path, event_cache: Path) -> Optional[RankStats]:
+    if not kernel_cache.exists() or not event_cache.exists():
+        return None
+    try:
+        kernel_payload = json.loads(kernel_cache.read_text(encoding="utf-8"))
+        event_payload = json.loads(event_cache.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    meta = trace_metadata(path)
+    if kernel_payload.get("trace") != meta or event_payload.get("trace") != meta:
+        return None
+
+    stats = RankStats(rank=rank)
+    stats.total_kernel_us = float(kernel_payload.get("total_kernel_us", 0.0))
+    stats.parsed_events = int(kernel_payload.get("parsed_events", 0))
+    stats.gpu_kernel_events = int(kernel_payload.get("gpu_kernel_events", 0))
+    stats.profiler_events = int(kernel_payload.get("profiler_events", 0))
+    stats.distributed_events = int(kernel_payload.get("distributed_events", 0))
+    stats.kernel_aggs = load_aggregate_map(kernel_payload.get("kernel_aggs", []))  # type: ignore[assignment]
+    stats.event_hotspots = load_aggregate_map(event_payload.get("event_hotspots", []))  # type: ignore[assignment]
+    for key, agg in stats.kernel_aggs.items():
+        kind = OpKind(key[0])
+        if is_distributed_kind(kind):
+            stats.distributed[kind].add(agg.total_us, agg.calls)
+    print(f"[INFO] Use cache for rank={rank}: {kernel_cache}", flush=True)
+    return stats
+
+
+def write_rank_stats_cache(path: Path, stats: RankStats, kernel_cache: Path, event_cache: Path) -> None:
+    kernel_cache.parent.mkdir(parents=True, exist_ok=True)
+    common = {
+        "trace": trace_metadata(path),
+        "rank": stats.rank,
+        "total_kernel_us": stats.total_kernel_us,
+        "parsed_events": stats.parsed_events,
+        "gpu_kernel_events": stats.gpu_kernel_events,
+        "profiler_events": stats.profiler_events,
+        "distributed_events": stats.distributed_events,
+    }
+    kernel_payload = {
+        **common,
+        "kernel_aggs": serialize_aggregate_map(stats.kernel_aggs),
+    }
+    event_payload = {
+        **common,
+        "event_hotspots": serialize_aggregate_map(stats.event_hotspots),
+    }
+    kernel_cache.write_text(json.dumps(kernel_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    event_cache.write_text(json.dumps(event_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def is_gpu_kernel_event(event: Dict[str, Any]) -> bool:
+    if event.get("ph") != "X":
+        return False
+    cat = str(event.get("cat", "")).lower()
+    name = str(event.get("name", "")).lower()
+    return cat in {"kernel", "gpu_memcpy", "gpu_memset"} or cat.startswith("kernel") or cat.startswith("gpu_") or (
+        cat == "" and ("nccl" in name or "kernel" in name)
+    )
+
+
+def is_profiler_hotspot_event(event: Dict[str, Any]) -> bool:
+    if event.get("ph") != "X" or is_gpu_kernel_event(event):
+        return False
+    dur = event.get("dur")
+    return isinstance(dur, (int, float)) and dur > 0
+
+
+def update_progress(stats: RankStats, progress_every: int, started_at: float) -> None:
+    if progress_every <= 0 or stats.parsed_events % progress_every != 0:
+        return
+    elapsed = time.time() - started_at
+    print(
+        f"[PROGRESS] events={stats.parsed_events:,} "
+        f"gpu_kernel_events={stats.gpu_kernel_events:,} "
+        f"profiler_events={stats.profiler_events:,} "
+        f"distributed_events={stats.distributed_events:,} "
+        f"elapsed={elapsed:.1f}s "
+        f"total_kernel_time_us={stats.total_kernel_us:.0f}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def parse_trace_file(
+    path: Path,
+    rank: int,
+    *,
+    progress_every: int = 200000,
+    max_events: Optional[int] = None,
+    output_dir: Optional[Path] = None,
+    use_cache: bool = True,
+) -> RankStats:
+    kernel_cache, event_cache = cache_paths(output_dir, rank)
+    if use_cache and kernel_cache is not None and event_cache is not None:
+        cached = load_rank_stats_from_cache(path, rank, kernel_cache, event_cache)
+        if cached is not None:
+            return cached
+
     cpu_op_by_external_id: Dict[str, str] = {}
     source_by_external_id: Dict[str, str] = {}
     rank_stats = RankStats(rank=rank)
+    started_at = time.time()
 
-    events = list(iter_trace_events(path))
-    for event in events:
-        if event.get("cat") not in {"cpu_op", "python_function"} or event.get("ph") != "X":
-            continue
-        args = event.get("args") if isinstance(event.get("args"), dict) else {}
-        external_id = args.get("External id")
-        if external_id is None:
-            continue
-        external_key = str(external_id)
-        name = str(event.get("name", ""))
-        if event.get("cat") == "cpu_op":
-            cpu_op_by_external_id[external_key] = name
-        elif ".py" in name:
-            source_by_external_id[external_key] = name.split(":", 1)[0]
-
-    for event in events:
-        if event.get("cat") != "kernel" or event.get("ph") != "X":
-            continue
+    print(f"[INFO] Parse trace rank={rank}: {path}", flush=True)
+    for event in iter_trace_events(path):
+        if max_events is not None and rank_stats.parsed_events >= max_events:
+            break
+        rank_stats.parsed_events += 1
         dur = event.get("dur", 0.0)
         if not isinstance(dur, (int, float)):
+            update_progress(rank_stats, progress_every, started_at)
             continue
         args = event.get("args") if isinstance(event.get("args"), dict) else {}
         external_id = args.get("External id")
         external_key = str(external_id) if external_id is not None else ""
-        kernel_name = normalize_name(str(event.get("name", "unknown")))
-        op_name = cpu_op_by_external_id.get(external_key, "")
-        source_file = source_by_external_id.get(external_key, "")
-        kind = classify_op_kind(kernel_name, op_name, source_file)
-        record = KernelRecord(
-            rank=rank,
-            name=kernel_name,
-            op_name=op_name or "unknown",
-            source_file=source_file,
-            dur_us=float(dur),
-            kind=kind,
-        )
-        rank_stats.total_kernel_us += float(dur)
-        rank_stats.kernels.append(record)
-        if is_distributed_kind(kind):
-            rank_stats.distributed[kind].add(float(dur))
+
+        cat = str(event.get("cat", ""))
+        name = normalize_name(str(event.get("name", "unknown"))).replace("unknow", "unknown")
+        if external_key:
+            if cat == "cpu_op":
+                cpu_op_by_external_id[external_key] = name
+            elif cat == "python_function" and ".py" in name:
+                source_by_external_id[external_key] = name.split(":", 1)[0]
+
+        if is_gpu_kernel_event(event):
+            op_name = cpu_op_by_external_id.get(external_key, "")
+            source_file = source_by_external_id.get(external_key, "")
+            kind = classify_op_kind(name, op_name, source_file)
+            rank_stats.total_kernel_us += float(dur)
+            rank_stats.gpu_kernel_events += 1
+            rank_stats.kernel_aggs[(kind.value, op_name or "unknown", name, source_file)].add(float(dur))
+            if is_distributed_kind(kind):
+                rank_stats.distributed[kind].add(float(dur))
+                rank_stats.distributed_events += 1
+        elif is_profiler_hotspot_event(event):
+            rank_stats.profiler_events += 1
+            source_file = source_by_external_id.get(external_key, "")
+            rank_stats.event_hotspots[(cat or "unknown", source_file, name)].add(float(dur))
+
+        update_progress(rank_stats, progress_every, started_at)
+
+    print(
+        f"[INFO] Parsed rank={rank} events={rank_stats.parsed_events:,} "
+        f"gpu_kernel_events={rank_stats.gpu_kernel_events:,} "
+        f"profiler_events={rank_stats.profiler_events:,} "
+        f"distributed_events={rank_stats.distributed_events:,}",
+        flush=True,
+    )
+
+    if use_cache and kernel_cache is not None and event_cache is not None:
+        write_rank_stats_cache(path, rank_stats, kernel_cache, event_cache)
 
     return rank_stats
 
 
 def merge_rank_stats(target: RankStats, source: RankStats) -> None:
     target.total_kernel_us += source.total_kernel_us
+    target.parsed_events += source.parsed_events
+    target.gpu_kernel_events += source.gpu_kernel_events
+    target.profiler_events += source.profiler_events
+    target.distributed_events += source.distributed_events
     target.kernels.extend(source.kernels)
     for kind, agg in source.distributed.items():
         target.distributed[kind].add(agg.total_us, agg.calls)
+    for key, agg in source.kernel_aggs.items():
+        target.kernel_aggs[key].add(agg.total_us, agg.calls)
+    for key, agg in source.event_hotspots.items():
+        target.event_hotspots[key].add(agg.total_us, agg.calls)
 
 
-def parse_profile_dir_by_rank(report_dir: Path, rank_selector: str = "0") -> ProfileStats:
+def parse_profile_dir_by_rank(
+    report_dir: Path,
+    rank_selector: str = "0",
+    *,
+    progress_every: int = 200000,
+    max_events: Optional[int] = None,
+    output_dir: Optional[Path] = None,
+    use_cache: bool = True,
+) -> ProfileStats:
     trace_files = sorted(
-        list(report_dir.glob("*.pt.trace.json"))
-        + list(report_dir.glob("*.trace.json"))
-        + list(report_dir.glob("*.pt.trace.json.gz"))
-        + list(report_dir.glob("*.trace.json.gz"))
+        set(
+            list(report_dir.glob("*.pt.trace.json"))
+            + list(report_dir.glob("*.trace.json"))
+            + list(report_dir.glob("*.pt.trace.json.gz"))
+            + list(report_dir.glob("*.trace.json.gz"))
+        )
     )
     trace_files = [path for path in trace_files if rank_matches(path, rank_selector)]
     if not trace_files:
@@ -428,7 +682,14 @@ def parse_profile_dir_by_rank(report_dir: Path, rank_selector: str = "0") -> Pro
         rank = extract_rank(trace_file)
         if rank is None:
             rank = 0 if rank_selector != "all" else len(rank_stats)
-        parsed = parse_trace_file(trace_file, rank)
+        parsed = parse_trace_file(
+            trace_file,
+            rank,
+            progress_every=progress_every,
+            max_events=max_events,
+            output_dir=output_dir,
+            use_cache=use_cache,
+        )
         if rank not in rank_stats:
             rank_stats[rank] = RankStats(rank=rank)
         merge_rank_stats(rank_stats[rank], parsed)
@@ -444,6 +705,7 @@ def parse_profile_dir_by_rank(report_dir: Path, rank_selector: str = "0") -> Pro
         trace_files=trace_files,
         total_kernel_us=total_kernel_us,
         profiler_txt_total_us=txt_total_us,
+        cache_dir=(output_dir / "cache") if output_dir else None,
     )
 
 
@@ -460,7 +722,9 @@ def fmt_pct(value: float) -> str:
 
 
 def md_escape(text: str) -> str:
-    return str(text).replace("|", "\\|")
+    value = str(text or "").replace("None", "")
+    value = re.sub(r"\bunknow\b", "unknown", value)
+    return value.replace("|", "\\|")
 
 
 def md_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
@@ -484,11 +748,319 @@ def aggregate_records(records: Iterable[KernelRecord]) -> List[Tuple[Tuple[str, 
     return sorted(out.items(), key=lambda item: item[1].total_us, reverse=True)
 
 
-def build_markdown(profile: ProfileStats, rank_selector: str) -> Tuple[str, List[Dict[str, Any]]]:
-    lines: List[str] = ["# SGLang Torch Profiler 分布式算子报告", ""]
+def aggregate_kernel_aggs(profile: ProfileStats) -> List[Tuple[Tuple[str, str, str, str], Aggregate]]:
+    out: Dict[Tuple[str, str, str, str], Aggregate] = defaultdict(Aggregate)
+    for stat in profile.rank_stats.values():
+        for key, agg in stat.kernel_aggs.items():
+            out[key].add(agg.total_us, agg.calls)
+    if out:
+        return sorted(out.items(), key=lambda item: item[1].total_us, reverse=True)
+    all_records = [record for stat in profile.rank_stats.values() for record in stat.kernels]
+    return aggregate_records(all_records)
+
+
+def aggregate_event_hotspots(profile: ProfileStats) -> List[Tuple[Tuple[str, str, str], Aggregate]]:
+    out: Dict[Tuple[str, str, str], Aggregate] = defaultdict(Aggregate)
+    for stat in profile.rank_stats.values():
+        for key, agg in stat.event_hotspots.items():
+            out[key].add(agg.total_us, agg.calls)
+    return sorted(out.items(), key=lambda item: item[1].total_us, reverse=True)
+
+
+REPORT_TYPE_LABELS = {
+    OpKind.DISTRIBUTED_ALL_REDUCE.value: "Communication/NCCL",
+    OpKind.DISTRIBUTED_ALL_GATHER.value: "Communication/NCCL",
+    OpKind.DISTRIBUTED_REDUCE_SCATTER.value: "Communication/NCCL",
+    OpKind.DISTRIBUTED_ALL_TO_ALL.value: "Communication/NCCL",
+    OpKind.DISTRIBUTED_BROADCAST.value: "Communication/NCCL",
+    OpKind.DISTRIBUTED_P2P.value: "Communication/NCCL",
+    OpKind.DISTRIBUTED_NCCL_OTHER.value: "Communication/NCCL",
+    OpKind.MOE.value: "MoE/Expert",
+    OpKind.ATTENTION.value: "Attention",
+    OpKind.GEMM.value: "GEMM/Linear",
+    OpKind.NORM.value: "Norm",
+    OpKind.KV_CACHE.value: "KV Cache",
+}
+
+
+def report_type_for(kind: str, op_name: str, kernel_name: str, source_file: str) -> str:
+    label = REPORT_TYPE_LABELS.get(kind)
+    if label:
+        return label
+    text, compact = normalized_search_text(kernel_name, op_name, source_file)
+    if has_keyword(text, compact, "rope", "rotary", "position", "mrope"):
+        return "RoPE/Position"
+    if has_keyword(text, compact, "sampling", "softmax", "topk", "argmax", "exponential"):
+        return "Sampling/Softmax"
+    if has_keyword(text, compact, "memcpy", "memset", "copy", "fill"):
+        return "Memcpy/Memset"
+    if "triton" in text:
+        return "Triton Other"
+    return "Other GPU Kernel"
+
+
+def compact_kernel_name(name: str, limit: int = 300) -> str:
+    safe = re.sub(r"\bunknow\b", "unknown", str(name or ""))
+    if len(safe) <= limit:
+        return safe
+    return safe[: limit - 3] + "..."
+
+
+def mentor_title(model_name: str) -> str:
+    base = model_name
+    for token in ("-P32768D1024C1", "-P512D64C4", "-P128D16", "-Tiny"):
+        base = base.replace(token, "")
+    base = base.replace("-TP4", " TP4")
+    return f"# FlagOSTune Torch Profiling 之 SGLang {base}"
+
+
+def find_config_for_model(model_name: str) -> Optional[Path]:
+    if not model_name:
+        return None
+    path = get_project_root() / f"config.yaml.{model_name}"
+    return path if path.exists() else None
+
+
+def load_model_config(model_name: str) -> Dict[str, Any]:
+    path = find_config_for_model(model_name)
+    if not path or yaml is None:
+        return {}
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def first_scenario(config: Dict[str, Any]) -> Dict[str, Any]:
+    scenarios = ((config.get("benchmark") or {}).get("scenarios") or {})
+    optimized = scenarios.get("optimized") or []
+    if isinstance(optimized, list) and optimized:
+        return optimized[0] or {}
+    for value in scenarios.values():
+        if isinstance(value, list) and value:
+            return value[0] or {}
+    return {}
+
+
+def infer_model_name(profile: ProfileStats) -> str:
+    for path in profile.trace_files:
+        parts = list(path.parts)
+        if "results" in parts:
+            idx = parts.index("results")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+    return ""
+
+
+def format_size(path: Path) -> str:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return "未采集"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{size} B"
+
+
+def build_environment_rows(profile: ProfileStats, rank_selector: str, model_name: str) -> List[List[str]]:
+    config = load_model_config(model_name)
+    scenario = first_scenario(config)
+    model_cfg = config.get("model") or {}
+    runtime_cfg = config.get("runtime") or {}
+    sglang_cfg = config.get("sglang") or {}
+    bench_cfg = config.get("benchmark") or {}
+    trace = profile.trace_files[0] if profile.trace_files else Path("")
+    cuda_visible = "未采集"
+    return [
+        ["机器", "单机 H20，卡数/单卡显存未采集"],
+        ["框架", "SGLang + Torch profiler"],
+        ["模型名", model_cfg.get("name") or model_name or "未采集"],
+        ["TP size", str(model_cfg.get("tensor_parallel_size", "未采集"))],
+        ["dtype / FP8", str(runtime_cfg.get("dtype", "未采集")) + (" / FP8" if "FP8" in model_name.upper() else "")],
+        ["CUDA_VISIBLE_DEVICES", cuda_visible],
+        ["测试场景", str(scenario.get("name") or "未采集").replace("_c", " concurrency: ")],
+        ["输入长度 / 输出长度 / 并发数 / runs", f"{scenario.get('input_len', '未采集')} / {scenario.get('output_len', '未采集')} / {scenario.get('concurrency', '未采集')} / {bench_cfg.get('num_runs', '未采集')}"],
+        ["gpu_memory_utilization", str(sglang_cfg.get("gpu_memory_utilization", sglang_cfg.get("mem_fraction_static", "未采集")))],
+        ["max_num_batched_tokens", str(sglang_cfg.get("max_num_batched_tokens", "未采集"))],
+        ["max_num_seqs", str(sglang_cfg.get("max_num_seqs", "未采集"))],
+        ["trace 文件路径", str(trace) if trace else "未采集"],
+        ["trace 大小", format_size(trace) if trace else "未采集"],
+        ["rank", rank_selector],
+    ]
+
+
+def scan_log_summary(model_name: str) -> List[List[str]]:
+    roots = [get_project_root() / "results" / model_name]
+    text_parts: List[str] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for log in root.rglob("*.log"):
+            try:
+                text_parts.append(log.read_text(encoding="utf-8", errors="ignore")[-200000:])
+            except OSError:
+                pass
+    text = "\n".join(text_parts)
+    if not text:
+        return [
+            ["模型加载显存", "未采集"],
+            ["profiling 前后显存", "未采集"],
+            ["请求数/吞吐/latency/TTFT/ITL/TPOT", "未采集"],
+            ["异常信息", "未在日志中发现 OOM / crash"],
+        ]
+    oom = re.findall(r".*(?:OOM|out of memory|crash|Traceback|ERROR).*", text, flags=re.IGNORECASE)
+    metric_lines = re.findall(r".*(?:throughput|latency|TTFT|ITL|TPOT|request).*", text, flags=re.IGNORECASE)
+    memory_lines = re.findall(r".*(?:memory|mem|显存).*", text, flags=re.IGNORECASE)
+    return [
+        ["模型加载显存", md_escape(memory_lines[0][:300]) if memory_lines else "未采集"],
+        ["profiling 前后显存", md_escape(memory_lines[-1][:300]) if memory_lines else "未采集"],
+        ["请求数/吞吐/latency/TTFT/ITL/TPOT", md_escape("<br>".join(line[:180] for line in metric_lines[:5])) if metric_lines else "未采集"],
+        ["异常信息", md_escape("<br>".join(line[:180] for line in oom[:5])) if oom else "未在日志中发现 OOM / crash"],
+    ]
+
+
+def build_conclusions(kernel_aggs: List[Tuple[Tuple[str, str, str, str], Aggregate]], type_rows: List[List[str]]) -> List[str]:
+    conclusions: List[str] = []
+    if not kernel_aggs:
+        return ["未采集到 CUDA/GPU kernel 数据。"]
+    type_totals = [(row[0], float(row[2])) for row in type_rows if row[2] != "0.000"]
+    if type_totals:
+        dominant = max(type_totals, key=lambda item: item[1])
+        conclusions.append(f"{dominant[0]} 是当前 rank 中总时间最高的类型，累计 {dominant[1]:.3f} ms。")
+    comm = [row for row in type_rows if row[0] == "Communication/NCCL" and row[2] != "0.000"]
+    if comm:
+        conclusions.append(f"通信类 kernel 占全部 GPU kernel 总时间 {comm[0][4]}，后续需要重点观察 TP 通信与计算重叠。")
+    top_names = [compact_kernel_name(item[0][2], 120) for item in kernel_aggs[:3]]
+    conclusions.append(f"Top1 kernel 为 `{top_names[0]}`；Top3 由 {'; '.join('`' + name + '`' for name in top_names)} 构成。")
+    labels = {row[0]: float(row[2]) for row in type_rows}
+    focus = max(("MoE/Expert", "Attention", "GEMM/Linear", "Communication/NCCL"), key=lambda name: labels.get(name, 0.0))
+    conclusions.append(f"MoE / Attention / GEMM / NCCL 中，{focus} 在表格聚合中占主导。")
+    if focus in {"MoE/Expert", "GEMM/Linear"}:
+        conclusions.append("FlagTree/Triton/megakernel 优化优先看专家计算、GEMM 形状合并和 launch 开销。")
+    elif focus == "Attention":
+        conclusions.append("后续优化优先看 Attention/KV cache 路径的融合与长上下文访存。")
+    else:
+        conclusions.append("后续优化优先看通信规约、rank 间负载均衡和计算通信重叠。")
+    return conclusions[:6]
+
+
+def build_type_rows(
+    kernel_aggs: List[Tuple[Tuple[str, str, str, str], Aggregate]],
+    total_ref: float,
+    non_comm_ref: float,
+) -> List[List[str]]:
+    type_order = [
+        "Communication/NCCL",
+        "MoE/Expert",
+        "Attention",
+        "GEMM/Linear",
+        "Norm",
+        "RoPE/Position",
+        "KV Cache",
+        "Sampling/Softmax",
+        "Memcpy/Memset",
+        "Triton Other",
+        "Other GPU Kernel",
+    ]
+    type_aggs: Dict[str, Aggregate] = {name: Aggregate() for name in type_order}
+    for (kind, op_name, kernel_name, source_file), agg in kernel_aggs:
+        type_aggs[report_type_for(kind, op_name, kernel_name, source_file)].add(agg.total_us, agg.calls)
+    type_rows: List[List[str]] = []
+    for label in type_order:
+        agg = type_aggs[label]
+        denom = total_ref if label == "Communication/NCCL" else non_comm_ref
+        type_rows.append([
+            label,
+            str(agg.calls),
+            fmt_ms(agg.total_us),
+            fmt_us(agg.avg_us),
+            fmt_pct(agg.total_us / total_ref if total_ref > 0 else 0.0),
+            fmt_pct(agg.total_us / denom if denom > 0 else 0.0),
+        ])
+    return type_rows
+
+
+def build_op_kernel_rows(
+    kernel_aggs: List[Tuple[Tuple[str, str, str, str], Aggregate]],
+    total_ref: float,
+    non_comm_ref: float,
+    top_kernels_per_op: int,
+) -> List[List[str]]:
+    groups: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for (kind, op_name, kernel_name, source_file), agg in kernel_aggs:
+        key = (kind, op_name, source_file)
+        group = groups.setdefault(key, {"calls": 0, "total_us": 0.0, "kernels": defaultdict(float)})
+        group["calls"] += agg.calls
+        group["total_us"] += agg.total_us
+        group["kernels"][kernel_name] += agg.total_us
+
+    rows: List[List[str]] = []
+    for (kind, op_name, source_file), group in sorted(groups.items(), key=lambda item: item[1]["total_us"], reverse=True)[:200]:
+        total_us = float(group["total_us"])
+        calls = int(group["calls"])
+        kernels = sorted(group["kernels"].items(), key=lambda item: item[1], reverse=True)[:top_kernels_per_op]
+        kernel_text = "<br>".join(md_escape(compact_kernel_name(name)) for name, _ in kernels)
+        denom = total_ref if kind.startswith(DISTRIBUTED_PREFIX) else non_comm_ref
+        rows.append([
+            md_escape(source_file),
+            md_escape(op_name),
+            kernel_text,
+            str(calls),
+            fmt_ms(total_us),
+            fmt_us(total_us / calls if calls else 0.0),
+            fmt_pct(total_us / denom if denom > 0 else 0.0),
+            fmt_pct(total_us / total_ref if total_ref > 0 else 0.0),
+        ])
+    return rows
+
+
+def build_markdown(
+    profile: ProfileStats,
+    rank_selector: str,
+    *,
+    model_name: str = "",
+    top_kernels_per_op: int = 8,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    model_name = model_name or infer_model_name(profile) or "unknown"
+    lines: List[str] = [mentor_title(model_name), ""]
     tables: List[Dict[str, Any]] = []
     distributed_total = profile.distributed_total_us
     total_ref = profile.total_kernel_us or profile.profiler_txt_total_us
+    non_comm_ref = max(profile.total_kernel_us - distributed_total, 0.0) or profile.total_kernel_us
+    parsed_events = sum(stat.parsed_events for stat in profile.rank_stats.values())
+    gpu_events = sum(stat.gpu_kernel_events for stat in profile.rank_stats.values())
+    all_kernel_aggs = aggregate_kernel_aggs(profile)
+    type_rows = build_type_rows(all_kernel_aggs, total_ref, non_comm_ref)
+
+    env_rows = build_environment_rows(profile, rank_selector, model_name)
+    lines.append("# 环境与运行配置")
+    lines.append("")
+    lines.append(md_table(["字段", "值"], env_rows))
+    lines.append("")
+    tables.append({"sheet_name": "Environment", "headers": ["字段", "值"], "rows": env_rows})
+
+    log_rows = scan_log_summary(model_name)
+    lines.append("# 显存与运行日志摘要")
+    lines.append("")
+    lines.append(md_table(["字段", "值"], log_rows))
+    lines.append("")
+    tables.append({"sheet_name": "LogSummary", "headers": ["字段", "值"], "rows": log_rows})
+
+    lines.append("# 算子数据")
+    lines.append("")
+    lines.append("1. 占比说明：Communication / NCCL / all_reduce 使用全部 GPU kernel 总时间作为分母；其它算子默认使用排除通信后的 GPU kernel 总时间作为分母；同时保留 overall_pct。")
+    lines.append("2. Torch profiler duration 是事件耗时累计，不完全等同 wall-clock latency。")
+    lines.append(f"3. 基于 torch profiler rank {rank_selector} trace 文件生成。")
+    lines.append(f"4. parsed events: {parsed_events:,}；gpu kernel events: {gpu_events:,}。")
+    lines.append("")
+    lines.append("# 核心结论")
+    lines.append("")
+    lines.extend(f"- {line}" for line in build_conclusions(all_kernel_aggs, type_rows))
+    lines.append("")
 
     overview_rows = [
         ["rank selector", rank_selector],
@@ -515,10 +1087,9 @@ def build_markdown(profile: ProfileStats, rank_selector: str) -> Tuple[str, List
         ["detected distributed keywords", ", ".join(detected_keywords) if detected_keywords else "none"],
         ["sanity note", sanity_note or "ok"],
     ]
-    lines.append("## Sanity Check")
-    lines.append("")
-    lines.append(md_table(["字段", "值"], sanity_rows))
-    lines.append("")
+    if sanity_note:
+        lines.append(f"> {sanity_note}")
+        lines.append("")
     tables.append({"sheet_name": "SanityCheck", "headers": ["字段", "值"], "rows": sanity_rows})
 
     dist_agg = aggregate_distributed(profile)
@@ -540,6 +1111,79 @@ def build_markdown(profile: ProfileStats, rank_selector: str) -> Tuple[str, List
         "headers": ["op_kind", "调用次数", "总时间(ms)", "平均时间(us)", "占比"],
         "rows": dist_rows,
     })
+
+    cuda_rows = build_op_kernel_rows(all_kernel_aggs, total_ref, non_comm_ref, top_kernels_per_op)
+    lines.append("## CUDA/GPU Kernel（按总时间排序）")
+    lines.append("")
+    lines.append(md_table(["source file", "op_name", "kernel_name", "调用次数", "总时间(ms)", "平均时间(us)", "占比", "overall_pct"], cuda_rows))
+    lines.append("")
+    tables.append({"sheet_name": "CUDA_GPU_Kernel", "headers": ["source file", "op_name", "kernel_name", "调用次数", "总时间(ms)", "平均时间(us)", "占比", "overall_pct"], "rows": cuda_rows})
+
+    event_rows: List[List[str]] = []
+    profiler_total = sum(agg.total_us for _, agg in aggregate_event_hotspots(profile))
+    for (event_type, source_file, event_name), agg in aggregate_event_hotspots(profile)[:200]:
+        event_rows.append([
+            md_escape(event_type),
+            md_escape(source_file),
+            md_escape(compact_kernel_name(event_name)),
+            str(agg.calls),
+            fmt_ms(agg.total_us),
+            fmt_us(agg.avg_us),
+            fmt_pct(agg.total_us / profiler_total if profiler_total > 0 else 0.0),
+        ])
+    lines.append("## Profiler Event 热点（按总时间排序）")
+    lines.append("")
+    lines.append(md_table(["event_type", "source file", "event_name", "调用次数", "总时间(ms)", "平均时间(us)", "占比"], event_rows))
+    lines.append("")
+    tables.append({"sheet_name": "ProfilerEventHotspot", "headers": ["event_type", "source file", "event_name", "调用次数", "总时间(ms)", "平均时间(us)", "占比"], "rows": event_rows})
+
+    dist_kernel_rows: List[List[str]] = []
+    for (kind, op_name, kernel_name, source_file), agg in [item for item in all_kernel_aggs if item[0][0].startswith(DISTRIBUTED_PREFIX)][:200]:
+        dist_kernel_rows.append([
+            kind,
+            md_escape(op_name),
+            md_escape(compact_kernel_name(kernel_name)),
+            md_escape(source_file),
+            str(agg.calls),
+            fmt_ms(agg.total_us),
+            fmt_us(agg.avg_us),
+        ])
+    lines.append("## Top 分布式 Kernel")
+    lines.append("")
+    lines.append(md_table(["op_kind", "op_name", "kernel_name", "source_file", "调用次数", "总时间(ms)", "平均时间(us)"], dist_kernel_rows))
+    lines.append("")
+    tables.append({
+        "sheet_name": "TopDistributedKernel",
+        "headers": ["op_kind", "op_name", "kernel_name", "source_file", "调用次数", "总时间(ms)", "平均时间(us)"],
+        "rows": dist_kernel_rows,
+    })
+
+    all_kernel_rows: List[List[str]] = []
+    for (kind, op_name, kernel_name, source_file), agg in all_kernel_aggs[:200]:
+        all_kernel_rows.append([
+            kind,
+            md_escape(op_name),
+            md_escape(compact_kernel_name(kernel_name)),
+            md_escape(source_file),
+            str(agg.calls),
+            fmt_ms(agg.total_us),
+            fmt_us(agg.avg_us),
+        ])
+    lines.append("## Top 全部 GPU Kernel")
+    lines.append("")
+    lines.append(md_table(["op_kind", "op_name", "kernel_name", "source_file", "调用次数", "总时间(ms)", "平均时间(us)"], all_kernel_rows))
+    lines.append("")
+    tables.append({
+        "sheet_name": "TopAllKernel",
+        "headers": ["op_kind", "op_name", "kernel_name", "source_file", "调用次数", "总时间(ms)", "平均时间(us)"],
+        "rows": all_kernel_rows,
+    })
+
+    lines.append("## 按类型聚合")
+    lines.append("")
+    lines.append(md_table(["类型", "调用次数", "总时间(ms)", "平均时间(us)", "overall_pct", "占比"], type_rows))
+    lines.append("")
+    tables.append({"sheet_name": "TypeAggregation", "headers": ["类型", "调用次数", "总时间(ms)", "平均时间(us)", "overall_pct", "占比"], "rows": type_rows})
 
     rank_rows: List[List[str]] = []
     all_kinds = sorted({kind for rank in profile.rank_stats.values() for kind in rank.distributed}, key=lambda x: x.value)
@@ -563,9 +1207,12 @@ def build_markdown(profile: ProfileStats, rank_selector: str) -> Tuple[str, List
             fmt_ms(min_us),
             "inf" if math.isinf(imbalance) else f"{imbalance:.3f}",
         ])
-    lines.append("## 按 Rank 对比")
+    lines.append("## Rank 对比")
     lines.append("")
-    lines.append(md_table(["op_kind", "各rank总时间(ms)", "各rank调用次数", "max(ms)", "min(ms)", "max/min"], rank_rows))
+    if rank_selector == "all":
+        lines.append(md_table(["op_kind", "各rank总时间(ms)", "各rank调用次数", "max(ms)", "min(ms)", "max/min"], rank_rows))
+    else:
+        lines.append(f"本报告基于 rank{rank_selector}。")
     lines.append("")
     tables.append({
         "sheet_name": "RankCompare",
@@ -573,56 +1220,12 @@ def build_markdown(profile: ProfileStats, rank_selector: str) -> Tuple[str, List
         "rows": rank_rows,
     })
 
-    all_records = [record for stat in profile.rank_stats.values() for record in stat.kernels]
-    distributed_records = [record for record in all_records if is_distributed_kind(record.kind)]
-    dist_kernel_rows: List[List[str]] = []
-    for (kind, op_name, kernel_name, source_file), agg in aggregate_records(distributed_records)[:200]:
-        dist_kernel_rows.append([
-            kind,
-            md_escape(op_name),
-            md_escape(kernel_name),
-            md_escape(source_file),
-            str(agg.calls),
-            fmt_ms(agg.total_us),
-            fmt_us(agg.avg_us),
-        ])
-    lines.append("## Top 分布式 Kernel")
-    lines.append("")
-    lines.append(md_table(["op_kind", "op_name", "kernel_name", "source_file", "调用次数", "总时间(ms)", "平均时间(us)"], dist_kernel_rows))
-    lines.append("")
-    tables.append({
-        "sheet_name": "TopDistributedKernel",
-        "headers": ["op_kind", "op_name", "kernel_name", "source_file", "调用次数", "总时间(ms)", "平均时间(us)"],
-        "rows": dist_kernel_rows,
-    })
-
-    all_kernel_rows: List[List[str]] = []
-    for (kind, op_name, kernel_name, source_file), agg in aggregate_records(all_records)[:200]:
-        all_kernel_rows.append([
-            kind,
-            md_escape(op_name),
-            md_escape(kernel_name),
-            md_escape(source_file),
-            str(agg.calls),
-            fmt_ms(agg.total_us),
-            fmt_us(agg.avg_us),
-        ])
-    lines.append("## Top 全部 Kernel")
-    lines.append("")
-    lines.append(md_table(["op_kind", "op_name", "kernel_name", "source_file", "调用次数", "总时间(ms)", "平均时间(us)"], all_kernel_rows))
-    lines.append("")
-    tables.append({
-        "sheet_name": "TopAllKernel",
-        "headers": ["op_kind", "op_name", "kernel_name", "source_file", "调用次数", "总时间(ms)", "平均时间(us)"],
-        "rows": all_kernel_rows,
-    })
-
     return "\n".join(lines), tables
 
 
 def write_excel(path: Path, tables: List[Dict[str, Any]]) -> None:
     if Workbook is None:
-        print("[WARN] 缺少 openpyxl，跳过 Excel 输出")
+        print("[WARN] 缺少 openpyxl，跳过 Excel 输出", flush=True)
         return
     wb = Workbook()
     wb.remove(wb.active)
@@ -640,6 +1243,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_path", type=str, default=None, help="报告输出目录")
     parser.add_argument("--rank", type=normalize_rank_selector, default="0", help="数字 rank 或 all")
     parser.add_argument("--workers", type=int, default=None, help="保留参数，当前解析器顺序解析")
+    parser.add_argument("--progress-every", type=int, default=200000, help="每解析多少个 event 输出一次进度，0 表示关闭")
+    parser.add_argument("--max-events", type=int, default=None, help="debug 用，最多解析多少个 event")
+    parser.add_argument("--no-xlsx", action="store_true", help="只生成 markdown，不写 Excel")
     return parser.parse_args()
 
 
@@ -651,14 +1257,24 @@ def main() -> int:
     report_dir = torch_dir / "report-sglang"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    profile = parse_profile_dir_by_rank(report_dir, rank_selector=args.rank)
-    markdown, tables = build_markdown(profile, args.rank)
+    profile = parse_profile_dir_by_rank(
+        report_dir,
+        rank_selector=args.rank,
+        progress_every=args.progress_every,
+        max_events=args.max_events,
+        output_dir=output_dir,
+    )
+    cfg = load_tool_config()
+    model_name = str(((cfg.get("paths") or {}).get("model_name") or infer_model_name(profile) or "unknown"))
+    markdown, tables = build_markdown(profile, args.rank, model_name=model_name)
     md_path = output_dir / "sglang_perf_analysis_torch.md"
     xlsx_path = output_dir / "sglang_perf_analysis_torch.xlsx"
     md_path.write_text(markdown, encoding="utf-8")
-    write_excel(xlsx_path, tables)
-    print(f"[INFO] Markdown report: {md_path}")
-    print(f"[INFO] Excel report: {xlsx_path}")
+    if not args.no_xlsx:
+        write_excel(xlsx_path, tables)
+    print(f"[INFO] Markdown report: {md_path}", flush=True)
+    if not args.no_xlsx:
+        print(f"[INFO] Excel report: {xlsx_path}", flush=True)
     return 0
 
 
