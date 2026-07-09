@@ -12,9 +12,11 @@ from scripts.tools.sglang_perf_analysis_torch import (
     build_markdown,
     classify_distributed_op,
     classify_op_kind,
+    is_gpu_kernel_event,
     extract_rank,
     iter_trace_events,
     parse_profile_dir_by_rank,
+    report_type_for,
 )
 
 
@@ -62,6 +64,18 @@ def profiler_event(name: str, cat: str, dur: float, external_id: int | None = No
         "tid": 7,
         "args": args,
     }
+
+
+def cuda_runtime_event(name: str, dur: float, correlation: int, external_id: int | None = None) -> dict:
+    event = profiler_event(name, "cuda_runtime", dur, external_id)
+    event["args"]["correlation"] = correlation
+    return event
+
+
+def correlated_kernel_event(name: str, dur: float, correlation: int) -> dict:
+    event = kernel_event(name, dur)
+    event["args"]["correlation"] = correlation
+    return event
 
 
 class SGLangPerfAnalysisTorchTest(unittest.TestCase):
@@ -225,7 +239,7 @@ class SGLangPerfAnalysisTorchTest(unittest.TestCase):
             )
             markdown, _ = build_markdown(profile, "0", model_name="Qwen3.6-35B-A3B-FP8-TP4-P32768D1024C1")
 
-        kernel_section = markdown.split("## Profiler Event 热点", 1)[0]
+        kernel_section = markdown.split("## True GPU Kernel", 1)[1].split("## Profiler Event 热点", 1)[0]
         self.assertIn("void cutlass_gemm_kernel", kernel_section)
         self.assertNotIn("sglang.forward", kernel_section)
         self.assertIn("## Profiler Event 热点（按总时间排序）", markdown)
@@ -259,6 +273,75 @@ class SGLangPerfAnalysisTorchTest(unittest.TestCase):
 
             self.assertEqual(first.total_kernel_us, second.total_kernel_us)
             self.assertEqual(first_mtime, os.path.getmtime(cache_file))
+
+    def test_true_gpu_kernel_filter_excludes_profiler_annotations(self) -> None:
+        excluded = [
+            profiler_event("scheduler.run_batch", "user_annotation", 1000.0),
+            profiler_event("step[DECODE bs=1]", "user_annotation", 900.0),
+            profiler_event("step[EXTEND bs=1 toks=16128]", "user_annotation", 800.0),
+            profiler_event("## Call CompiledFxGraph", "cpu_op", 700.0),
+            profiler_event("cudaLaunchKernel", "cuda_runtime", 10.0),
+        ]
+        for event in excluded:
+            self.assertFalse(is_gpu_kernel_event(event), event["name"])
+
+        included = [
+            kernel_event("ncclDevKernel_AllGather_RING_LL", 20.0),
+            kernel_event("void my_kernel(float*)", 30.0),
+            kernel_event("triton__kernel", 40.0),
+            kernel_event("cutlass::device_kernel<flashinfer::foo>", 50.0),
+            profiler_event("Memcpy DtoH", "gpu_memcpy", 5.0),
+        ]
+        for event in included:
+            self.assertTrue(is_gpu_kernel_event(event), event["name"])
+
+    def test_report_type_classifies_attention_norm_quant_and_linear_attention(self) -> None:
+        self.assertEqual(
+            report_type_for(OpKind.ATTENTION.value, "", "radix_attention_kernel", ""),
+            "Attention",
+        )
+        self.assertEqual(
+            report_type_for(OpKind.MAMBA_OR_LINEAR_ATTENTION.value, "", "hybrid_linear_attn_gated_delta_kernel", ""),
+            "Linear Attention / Mamba",
+        )
+        self.assertEqual(
+            report_type_for(OpKind.NORM.value, "", "kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnorm", ""),
+            "Norm/Fused Norm",
+        )
+        self.assertEqual(
+            report_type_for(OpKind.NON_DISTRIBUTED.value, "", "per_token_group_quant_8bit_v2", ""),
+            "Quantization/Dequantization",
+        )
+
+    def test_parser_uses_correlation_metadata_and_does_not_count_comm_annotations_as_gpu_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report-sglang"
+            report_dir.mkdir()
+            write_trace(
+                report_dir / "worker-rank0.pt.trace.json",
+                [
+                    cpu_op_event("torch.distributed.all_gather", 10),
+                    profiler_event("nccl:_all_gather_base", "user_annotation", 300.0, 10),
+                    cuda_runtime_event("cudaLaunchKernel", 5.0, correlation=77, external_id=10),
+                    correlated_kernel_event("ncclDevKernel_AllGather_RING_LL", 20.0, correlation=77),
+                    profiler_event("scheduler.run_batch", "user_annotation", 1000.0),
+                ],
+            )
+
+            profile = parse_profile_dir_by_rank(
+                report_dir,
+                rank_selector="0",
+                progress_every=0,
+                use_cache=False,
+            )
+            markdown, _ = build_markdown(profile, "0", model_name="Qwen3.6-35B-A3B-FP8-TP4-P32768D1024C1")
+
+        self.assertEqual(profile.total_kernel_us, 20.0)
+        self.assertEqual(profile.rank_stats[0].distributed[DistributedOpKind.DISTRIBUTED_ALL_GATHER].calls, 1)
+        self.assertIn("torch.distributed.all_gather", markdown)
+        kernel_section = markdown.split("## True GPU Kernel", 1)[1].split("## Profiler Event 热点", 1)[0]
+        self.assertNotIn("scheduler.run_batch", kernel_section)
+        self.assertIn("duplicate_comm_event_filtered_count", markdown)
 
 
 if __name__ == "__main__":

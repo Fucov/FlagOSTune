@@ -125,6 +125,7 @@ class RankStats:
     gpu_kernel_events: int = 0
     profiler_events: int = 0
     distributed_events: int = 0
+    duplicate_comm_event_filtered_count: int = 0
     distributed: DefaultDict[OpKind, Aggregate] = field(
         default_factory=lambda: defaultdict(Aggregate)
     )
@@ -152,6 +153,9 @@ class ProfileStats:
             for rank_stat in self.rank_stats.values()
             for agg in rank_stat.distributed.values()
         )
+
+
+CACHE_SCHEMA_VERSION = 2
 
 
 def get_project_root() -> Path:
@@ -251,9 +255,6 @@ def classify_op_kind(
 ) -> OpKind:
     text, compact = normalized_search_text(kernel_name, op_name, source_file)
 
-    if is_flash_attention_internal(text, compact):
-        return OpKind.ATTENTION
-
     if has_keyword(text, compact, "all_reduce", "allreduce", "all-reduce"):
         return OpKind.DISTRIBUTED_ALL_REDUCE
     if has_keyword(text, compact, "reduce_scatter", "reducescatter", "reduce-scatter"):
@@ -273,32 +274,49 @@ def classify_op_kind(
     if has_keyword(text, compact, "processgroup", "c10d", "record_param_comms", "custom_ar"):
         return OpKind.DISTRIBUTED_NCCL_OTHER
 
+    if has_keyword(text, compact, "rms_norm", "rmsnorm", "layer_norm", "layernorm", "l2norm", "fused_add_rmsnorm", "normkernel", "norm"):
+        return OpKind.NORM
+    if has_keyword(
+        text,
+        compact,
+        "hybrid_linear_attn",
+        "linear_attention",
+        "linearattention",
+        "gdn_backend",
+        "gated_delta",
+        "causal_conv1d",
+        "fused_recurrent",
+        "mamba",
+    ):
+        return OpKind.MAMBA_OR_LINEAR_ATTENTION
+    if is_flash_attention_internal(text, compact):
+        return OpKind.ATTENTION
     if has_keyword(
         text,
         compact,
         "flash_attn",
         "flashattn",
+        "flashinfer",
         "attention",
         "attn",
+        "radix_attention",
         "paged_attention",
         "sparse_attn",
         "rotary",
+        "qkv",
+        "kv_splits",
     ):
         return OpKind.ATTENTION
     if has_keyword(text, compact, "moe", "expert", "topk"):
         return OpKind.MOE
     if has_keyword(text, compact, "gemm", "matmul", "mm_kernel", "cutlass", "cublas"):
         return OpKind.GEMM
-    if has_keyword(text, compact, "rms_norm", "rmsnorm", "layer_norm", "layernorm", "l2norm", "norm"):
-        return OpKind.NORM
     if has_keyword(text, compact, "silu", "gelu", "relu", "activation", "doactivation", "swiglu"):
         return OpKind.ACTIVATION
     if has_keyword(text, compact, "kv_cache", "kvcache", "cache_kernel", "reshape_and_cache", "concat_and_cache"):
         return OpKind.KV_CACHE
     if has_keyword(text, compact, "index", "gather", "scatter", "sort", "nonzero", "where"):
         return OpKind.INDEXING
-    if has_keyword(text, compact, "mamba", "linear_attention", "linearattention", "gated_delta"):
-        return OpKind.MAMBA_OR_LINEAR_ATTENTION
     return OpKind.NON_DISTRIBUTED
 
 
@@ -461,6 +479,68 @@ def trace_metadata(path: Path) -> Dict[str, Any]:
     }
 
 
+def event_args(event: Dict[str, Any]) -> Dict[str, Any]:
+    args = event.get("args")
+    return args if isinstance(args, dict) else {}
+
+
+def get_external_key(event: Dict[str, Any]) -> str:
+    external_id = event_args(event).get("External id")
+    return str(external_id) if external_id is not None else ""
+
+
+def get_correlation_key(event: Dict[str, Any]) -> str:
+    args = event_args(event)
+    for key in ("correlation", "Correlation ID", "correlation id", "Correlation Id"):
+        value = args.get(key)
+        if value is not None:
+            return str(value)
+    return ""
+
+
+def extract_source_from_args(args: Dict[str, Any]) -> str:
+    for key in ("Source Location", "source", "Source", "file", "File", "filename", "Filename"):
+        value = args.get(key)
+        if isinstance(value, str) and value:
+            return value.split("\n", 1)[0]
+    for key in ("Stack", "stack", "Call stack", "Call Stack", "Python stack"):
+        value = args.get(key)
+        if isinstance(value, str):
+            for line in value.splitlines():
+                if ".py" in line:
+                    return line.strip()
+        elif isinstance(value, list):
+            for item in value:
+                text = str(item)
+                if ".py" in text:
+                    return text.strip()
+    return ""
+
+
+def is_comm_text(*parts: str) -> bool:
+    text, compact = normalized_search_text(" ".join(parts))
+    return has_keyword(
+        text,
+        compact,
+        "all_reduce",
+        "allreduce",
+        "all_gather",
+        "allgather",
+        "reduce_scatter",
+        "reducescatter",
+        "all_to_all",
+        "alltoall",
+        "broadcast",
+        "barrier",
+        "send",
+        "recv",
+        "nccl",
+        "collective",
+        "custom_all_reduce",
+        "outplace_all_reduce",
+    )
+
+
 def cache_paths(output_dir: Optional[Path], rank: int) -> Tuple[Optional[Path], Optional[Path]]:
     if output_dir is None:
         return None, None
@@ -493,6 +573,8 @@ def load_rank_stats_from_cache(path: Path, rank: int, kernel_cache: Path, event_
         event_payload = json.loads(event_cache.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    if kernel_payload.get("schema_version") != CACHE_SCHEMA_VERSION:
+        return None
     meta = trace_metadata(path)
     if kernel_payload.get("trace") != meta or event_payload.get("trace") != meta:
         return None
@@ -503,6 +585,7 @@ def load_rank_stats_from_cache(path: Path, rank: int, kernel_cache: Path, event_
     stats.gpu_kernel_events = int(kernel_payload.get("gpu_kernel_events", 0))
     stats.profiler_events = int(kernel_payload.get("profiler_events", 0))
     stats.distributed_events = int(kernel_payload.get("distributed_events", 0))
+    stats.duplicate_comm_event_filtered_count = int(kernel_payload.get("duplicate_comm_event_filtered_count", 0))
     stats.kernel_aggs = load_aggregate_map(kernel_payload.get("kernel_aggs", []))  # type: ignore[assignment]
     stats.event_hotspots = load_aggregate_map(event_payload.get("event_hotspots", []))  # type: ignore[assignment]
     for key, agg in stats.kernel_aggs.items():
@@ -516,6 +599,7 @@ def load_rank_stats_from_cache(path: Path, rank: int, kernel_cache: Path, event_
 def write_rank_stats_cache(path: Path, stats: RankStats, kernel_cache: Path, event_cache: Path) -> None:
     kernel_cache.parent.mkdir(parents=True, exist_ok=True)
     common = {
+        "schema_version": CACHE_SCHEMA_VERSION,
         "trace": trace_metadata(path),
         "rank": stats.rank,
         "total_kernel_us": stats.total_kernel_us,
@@ -523,6 +607,7 @@ def write_rank_stats_cache(path: Path, stats: RankStats, kernel_cache: Path, eve
         "gpu_kernel_events": stats.gpu_kernel_events,
         "profiler_events": stats.profiler_events,
         "distributed_events": stats.distributed_events,
+        "duplicate_comm_event_filtered_count": stats.duplicate_comm_event_filtered_count,
     }
     kernel_payload = {
         **common,
@@ -541,8 +626,20 @@ def is_gpu_kernel_event(event: Dict[str, Any]) -> bool:
         return False
     cat = str(event.get("cat", "")).lower()
     name = str(event.get("name", "")).lower()
-    return cat in {"kernel", "gpu_memcpy", "gpu_memset"} or cat.startswith("kernel") or cat.startswith("gpu_") or (
-        cat == "" and ("nccl" in name or "kernel" in name)
+    if cat in {"python_function", "user_annotation", "cpu_op", "cuda_runtime", "cuda_driver", "trace"}:
+        return False
+    if any(token in name for token in ("scheduler.run_batch", "scheduler.get_next_batch_to_run", "step[decode", "step[extend", "compiledfxgraph")):
+        return False
+    if cat in {"kernel", "gpu_memcpy", "gpu_memset"} or cat.startswith("kernel"):
+        return True
+    if cat.startswith("gpu_") and cat not in {"gpu_user_annotation", "gpu_annotation"}:
+        return True
+    args_text = " ".join(str(value).lower() for value in event_args(event).values())
+    return bool(
+        re.search(
+            r"(nccldevkernel|void .*kernel|triton.*kernel|cutlass::device_kernel|nvjet|memcpy|memset)",
+            name + " " + args_text,
+        )
     )
 
 
@@ -586,6 +683,7 @@ def parse_trace_file(
 
     cpu_op_by_external_id: Dict[str, str] = {}
     source_by_external_id: Dict[str, str] = {}
+    runtime_external_by_correlation: Dict[str, str] = {}
     rank_stats = RankStats(rank=rank)
     started_at = time.time()
 
@@ -598,21 +696,27 @@ def parse_trace_file(
         if not isinstance(dur, (int, float)):
             update_progress(rank_stats, progress_every, started_at)
             continue
-        args = event.get("args") if isinstance(event.get("args"), dict) else {}
-        external_id = args.get("External id")
-        external_key = str(external_id) if external_id is not None else ""
+        args = event_args(event)
+        external_key = get_external_key(event)
+        correlation_key = get_correlation_key(event)
 
         cat = str(event.get("cat", ""))
         name = normalize_name(str(event.get("name", "unknown"))).replace("unknow", "unknown")
         if external_key:
+            source_from_args = extract_source_from_args(args)
+            if source_from_args:
+                source_by_external_id[external_key] = source_from_args
             if cat == "cpu_op":
                 cpu_op_by_external_id[external_key] = name
             elif cat == "python_function" and ".py" in name:
                 source_by_external_id[external_key] = name.split(":", 1)[0]
+        if correlation_key and external_key and cat in {"cuda_runtime", "cuda_driver"}:
+            runtime_external_by_correlation[correlation_key] = external_key
 
         if is_gpu_kernel_event(event):
-            op_name = cpu_op_by_external_id.get(external_key, "")
-            source_file = source_by_external_id.get(external_key, "")
+            mapped_external_key = external_key or runtime_external_by_correlation.get(correlation_key, "")
+            op_name = cpu_op_by_external_id.get(mapped_external_key, "")
+            source_file = source_by_external_id.get(mapped_external_key, "") or extract_source_from_args(args)
             kind = classify_op_kind(name, op_name, source_file)
             rank_stats.total_kernel_us += float(dur)
             rank_stats.gpu_kernel_events += 1
@@ -622,8 +726,10 @@ def parse_trace_file(
                 rank_stats.distributed_events += 1
         elif is_profiler_hotspot_event(event):
             rank_stats.profiler_events += 1
-            source_file = source_by_external_id.get(external_key, "")
+            source_file = source_by_external_id.get(external_key, "") or extract_source_from_args(args)
             rank_stats.event_hotspots[(cat or "unknown", source_file, name)].add(float(dur))
+            if is_comm_text(name, cat, source_file):
+                rank_stats.duplicate_comm_event_filtered_count += 1
 
         update_progress(rank_stats, progress_every, started_at)
 
@@ -647,6 +753,7 @@ def merge_rank_stats(target: RankStats, source: RankStats) -> None:
     target.gpu_kernel_events += source.gpu_kernel_events
     target.profiler_events += source.profiler_events
     target.distributed_events += source.distributed_events
+    target.duplicate_comm_event_filtered_count += source.duplicate_comm_event_filtered_count
     target.kernels.extend(source.kernels)
     for kind, agg in source.distributed.items():
         target.distributed[kind].add(agg.total_us, agg.calls)
@@ -777,8 +884,10 @@ REPORT_TYPE_LABELS = {
     OpKind.DISTRIBUTED_NCCL_OTHER.value: "Communication/NCCL",
     OpKind.MOE.value: "MoE/Expert",
     OpKind.ATTENTION.value: "Attention",
+    OpKind.MAMBA_OR_LINEAR_ATTENTION.value: "Linear Attention / Mamba",
     OpKind.GEMM.value: "GEMM/Linear",
-    OpKind.NORM.value: "Norm",
+    OpKind.NORM.value: "Norm/Fused Norm",
+    OpKind.ACTIVATION.value: "Activation",
     OpKind.KV_CACHE.value: "KV Cache",
 }
 
@@ -790,8 +899,12 @@ def report_type_for(kind: str, op_name: str, kernel_name: str, source_file: str)
     text, compact = normalized_search_text(kernel_name, op_name, source_file)
     if has_keyword(text, compact, "rope", "rotary", "position", "mrope"):
         return "RoPE/Position"
+    if has_keyword(text, compact, "quant", "dequant", "per_token_group_quant", "fp8", "int8"):
+        return "Quantization/Dequantization"
     if has_keyword(text, compact, "sampling", "softmax", "topk", "argmax", "exponential"):
         return "Sampling/Softmax"
+    if has_keyword(text, compact, "index", "gather", "scatter", "sort", "where", "nonzero"):
+        return "Indexing/Gather/Scatter"
     if has_keyword(text, compact, "memcpy", "memset", "copy", "fill"):
         return "Memcpy/Memset"
     if "triton" in text:
@@ -914,16 +1027,22 @@ def scan_log_summary(model_name: str) -> List[List[str]]:
         ]
     oom = re.findall(r".*(?:OOM|out of memory|crash|Traceback|ERROR).*", text, flags=re.IGNORECASE)
     metric_lines = re.findall(r".*(?:throughput|latency|TTFT|ITL|TPOT|request).*", text, flags=re.IGNORECASE)
-    memory_lines = re.findall(r".*(?:memory|mem|显存).*", text, flags=re.IGNORECASE)
+    memory_lines = re.findall(
+        r".*(?:Required memory for warmup|Available memory|GPU memory pool size|max_running_requests was reduced|total_gpu_memory|available_gpu_memory|memory_usage).*",
+        text,
+        flags=re.IGNORECASE,
+    )
+    load_memory = [line for line in memory_lines if re.search(r"Required memory for warmup|GPU memory pool size|total_gpu_memory", line, flags=re.IGNORECASE)]
+    profile_memory = [line for line in memory_lines if re.search(r"Available memory|available_gpu_memory|memory_usage|max_running_requests was reduced", line, flags=re.IGNORECASE)]
     return [
-        ["模型加载显存", md_escape(memory_lines[0][:300]) if memory_lines else "未采集"],
-        ["profiling 前后显存", md_escape(memory_lines[-1][:300]) if memory_lines else "未采集"],
+        ["模型加载显存", md_escape("<br>".join(line[:220] for line in load_memory[:3])) if load_memory else "未采集"],
+        ["profiling 前后显存", md_escape("<br>".join(line[:220] for line in profile_memory[:3])) if profile_memory else "未采集"],
         ["请求数/吞吐/latency/TTFT/ITL/TPOT", md_escape("<br>".join(line[:180] for line in metric_lines[:5])) if metric_lines else "未采集"],
         ["异常信息", md_escape("<br>".join(line[:180] for line in oom[:5])) if oom else "未在日志中发现 OOM / crash"],
     ]
 
 
-def build_conclusions(kernel_aggs: List[Tuple[Tuple[str, str, str, str], Aggregate]], type_rows: List[List[str]]) -> List[str]:
+def build_gpu_conclusions(kernel_aggs: List[Tuple[Tuple[str, str, str, str], Aggregate]], type_rows: List[List[str]]) -> List[str]:
     conclusions: List[str] = []
     if not kernel_aggs:
         return ["未采集到 CUDA/GPU kernel 数据。"]
@@ -937,7 +1056,7 @@ def build_conclusions(kernel_aggs: List[Tuple[Tuple[str, str, str, str], Aggrega
     top_names = [compact_kernel_name(item[0][2], 120) for item in kernel_aggs[:3]]
     conclusions.append(f"Top1 kernel 为 `{top_names[0]}`；Top3 由 {'; '.join('`' + name + '`' for name in top_names)} 构成。")
     labels = {row[0]: float(row[2]) for row in type_rows}
-    focus = max(("MoE/Expert", "Attention", "GEMM/Linear", "Communication/NCCL"), key=lambda name: labels.get(name, 0.0))
+    focus = max(("MoE/Expert", "Attention", "Linear Attention / Mamba", "GEMM/Linear", "Communication/NCCL"), key=lambda name: labels.get(name, 0.0))
     conclusions.append(f"MoE / Attention / GEMM / NCCL 中，{focus} 在表格聚合中占主导。")
     if focus in {"MoE/Expert", "GEMM/Linear"}:
         conclusions.append("FlagTree/Triton/megakernel 优化优先看专家计算、GEMM 形状合并和 launch 开销。")
@@ -946,6 +1065,19 @@ def build_conclusions(kernel_aggs: List[Tuple[Tuple[str, str, str, str], Aggrega
     else:
         conclusions.append("后续优化优先看通信规约、rank 间负载均衡和计算通信重叠。")
     return conclusions[:6]
+
+
+def build_event_conclusions(event_aggs: List[Tuple[Tuple[str, str, str], Aggregate]]) -> List[str]:
+    if not event_aggs:
+        return ["未采集到 profiler event 热点。"]
+    total = sum(agg.total_us for _, agg in event_aggs)
+    top = event_aggs[0]
+    event_type, _source, event_name = top[0]
+    pct = top[1].total_us / total if total else 0.0
+    return [
+        f"Profiler Event 热点 Top1 为 `{compact_kernel_name(event_name, 120)}`，类型 `{event_type}`，占 profiler event 累计耗时 {fmt_pct(pct)}。",
+        "该表用于观察端到端调度、Python、runtime 和 annotation 热点，不计入 True GPU Kernel 总时间。",
+    ]
 
 
 def build_type_rows(
@@ -957,11 +1089,15 @@ def build_type_rows(
         "Communication/NCCL",
         "MoE/Expert",
         "Attention",
+        "Linear Attention / Mamba",
         "GEMM/Linear",
-        "Norm",
+        "Norm/Fused Norm",
+        "Activation",
+        "Quantization/Dequantization",
         "RoPE/Position",
         "KV Cache",
         "Sampling/Softmax",
+        "Indexing/Gather/Scatter",
         "Memcpy/Memset",
         "Triton Other",
         "Other GPU Kernel",
@@ -982,6 +1118,27 @@ def build_type_rows(
             fmt_pct(agg.total_us / denom if denom > 0 else 0.0),
         ])
     return type_rows
+
+
+def build_credibility_rows(profile: ProfileStats) -> List[List[str]]:
+    parsed_events = sum(stat.parsed_events for stat in profile.rank_stats.values())
+    true_gpu_kernel_events = sum(stat.gpu_kernel_events for stat in profile.rank_stats.values())
+    profiler_event_events = sum(stat.profiler_events for stat in profile.rank_stats.values())
+    duplicate_comm = sum(stat.duplicate_comm_event_filtered_count for stat in profile.rank_stats.values())
+    kernel_aggs = aggregate_kernel_aggs(profile)
+    total_calls = sum(agg.calls for _, agg in kernel_aggs)
+    unknown_calls = sum(agg.calls for (kind, op_name, _kernel, _source), agg in kernel_aggs if op_name == "unknown" or kind == OpKind.NON_DISTRIBUTED.value)
+    unmapped_calls = sum(agg.calls for (_kind, op_name, _kernel, _source), agg in kernel_aggs if op_name == "unknown")
+    missing_source_calls = sum(agg.calls for (_kind, _op_name, _kernel, source), agg in kernel_aggs if not source)
+    return [
+        ["parsed events", f"{parsed_events:,}"],
+        ["true_gpu_kernel_events", f"{true_gpu_kernel_events:,}"],
+        ["profiler_event_events", f"{profiler_event_events:,}"],
+        ["unmapped_kernel_pct", fmt_pct(unmapped_calls / total_calls if total_calls else 0.0)],
+        ["unknown_op_pct", fmt_pct(unknown_calls / total_calls if total_calls else 0.0)],
+        ["source_file_missing_pct", fmt_pct(missing_source_calls / total_calls if total_calls else 0.0)],
+        ["duplicate_comm_event_filtered_count", f"{duplicate_comm:,}"],
+    ]
 
 
 def build_op_kernel_rows(
@@ -1034,6 +1191,7 @@ def build_markdown(
     parsed_events = sum(stat.parsed_events for stat in profile.rank_stats.values())
     gpu_events = sum(stat.gpu_kernel_events for stat in profile.rank_stats.values())
     all_kernel_aggs = aggregate_kernel_aggs(profile)
+    event_aggs = aggregate_event_hotspots(profile)
     type_rows = build_type_rows(all_kernel_aggs, total_ref, non_comm_ref)
 
     env_rows = build_environment_rows(profile, rank_selector, model_name)
@@ -1055,11 +1213,25 @@ def build_markdown(
     lines.append("1. 占比说明：Communication / NCCL / all_reduce 使用全部 GPU kernel 总时间作为分母；其它算子默认使用排除通信后的 GPU kernel 总时间作为分母；同时保留 overall_pct。")
     lines.append("2. Torch profiler duration 是事件耗时累计，不完全等同 wall-clock latency。")
     lines.append(f"3. 基于 torch profiler rank {rank_selector} trace 文件生成。")
-    lines.append(f"4. parsed events: {parsed_events:,}；gpu kernel events: {gpu_events:,}。")
+    lines.append(f"4. parsed events: {parsed_events:,}；true gpu kernel events: {gpu_events:,}。")
+    lines.append("5. 本报告 True GPU Kernel 只统计真实 CUDA/NCCL/Triton kernel；fast_trace_kernel_summary.py 的 gpu_events 是 kernel-like 快速过滤口径，会包含更多 CUDA/runtime/Triton/高层相似事件，二者不可直接对齐。")
     lines.append("")
+    credibility_rows = build_credibility_rows(profile)
+    lines.append("# 数据可信度说明")
+    lines.append("")
+    lines.append(md_table(["字段", "值"], credibility_rows))
+    lines.append("")
+    lines.append("说明：如果 trace 不包含 stack 或 launch correlation，source_file 可能为空；unknown_op_pct 越高，表示 kernel 到 cpu_op 的关联越不完整。")
+    lines.append("")
+    tables.append({"sheet_name": "Credibility", "headers": ["字段", "值"], "rows": credibility_rows})
+
     lines.append("# 核心结论")
     lines.append("")
-    lines.extend(f"- {line}" for line in build_conclusions(all_kernel_aggs, type_rows))
+    lines.append("GPU kernel 结论：")
+    lines.extend(f"- {line}" for line in build_gpu_conclusions(all_kernel_aggs, type_rows))
+    lines.append("")
+    lines.append("Profiler Event 结论：")
+    lines.extend(f"- {line}" for line in build_event_conclusions(event_aggs))
     lines.append("")
 
     overview_rows = [
@@ -1113,15 +1285,15 @@ def build_markdown(
     })
 
     cuda_rows = build_op_kernel_rows(all_kernel_aggs, total_ref, non_comm_ref, top_kernels_per_op)
-    lines.append("## CUDA/GPU Kernel（按总时间排序）")
+    lines.append("## True GPU Kernel（按总时间排序）")
     lines.append("")
     lines.append(md_table(["source file", "op_name", "kernel_name", "调用次数", "总时间(ms)", "平均时间(us)", "占比", "overall_pct"], cuda_rows))
     lines.append("")
     tables.append({"sheet_name": "CUDA_GPU_Kernel", "headers": ["source file", "op_name", "kernel_name", "调用次数", "总时间(ms)", "平均时间(us)", "占比", "overall_pct"], "rows": cuda_rows})
 
     event_rows: List[List[str]] = []
-    profiler_total = sum(agg.total_us for _, agg in aggregate_event_hotspots(profile))
-    for (event_type, source_file, event_name), agg in aggregate_event_hotspots(profile)[:200]:
+    profiler_total = sum(agg.total_us for _, agg in event_aggs)
+    for (event_type, source_file, event_name), agg in event_aggs[:200]:
         event_rows.append([
             md_escape(event_type),
             md_escape(source_file),
