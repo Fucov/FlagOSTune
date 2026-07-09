@@ -28,6 +28,11 @@ SCENARIO_TYPE="optimized"
 TORCH_PROFILE=false
 RUNS_OVERRIDE=""
 DRY_RUN=false
+TORCH_WITH_STACK="false"
+TORCH_RECORD_SHAPES="false"
+TORCH_PROFILE_MEMORY="false"
+TORCH_WITH_MODULES="false"
+TORCH_PROFILER_LIGHT="true"
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -55,6 +60,26 @@ parse_args() {
             --dry-run)
                 DRY_RUN=true
                 shift
+                ;;
+            --torch-with-stack)
+                TORCH_WITH_STACK="$2"
+                shift 2
+                ;;
+            --torch-record-shapes)
+                TORCH_RECORD_SHAPES="$2"
+                shift 2
+                ;;
+            --torch-profile-memory)
+                TORCH_PROFILE_MEMORY="$2"
+                shift 2
+                ;;
+            --torch-with-modules)
+                TORCH_WITH_MODULES="$2"
+                shift 2
+                ;;
+            --torch-profiler-light)
+                TORCH_PROFILER_LIGHT="$2"
+                shift 2
                 ;;
             -h|--help)
                 head -4 "$0" | tail -2
@@ -154,6 +179,11 @@ update_tool_config() {
     yq -i ".current_run.device = \"${DEVICE}\"" "$TOOL_CONFIG"
     yq -i ".current_run.scenario_type = \"${SCENARIO_TYPE}\"" "$TOOL_CONFIG"
     yq -i ".current_run.torch_profile = true" "$TOOL_CONFIG"
+    yq -i ".current_run.torch_profiler_light = ${TORCH_PROFILER_LIGHT}" "$TOOL_CONFIG"
+    yq -i ".current_run.torch_with_stack = ${TORCH_WITH_STACK}" "$TOOL_CONFIG"
+    yq -i ".current_run.torch_record_shapes = ${TORCH_RECORD_SHAPES}" "$TOOL_CONFIG"
+    yq -i ".current_run.torch_profile_memory = ${TORCH_PROFILE_MEMORY}" "$TOOL_CONFIG"
+    yq -i ".current_run.torch_with_modules = ${TORCH_WITH_MODULES}" "$TOOL_CONFIG"
 
     yq -i ".model.path = \"${model_path}\"" "$TOOL_CONFIG"
     yq -i ".model.name = \"${model_name}\"" "$TOOL_CONFIG"
@@ -182,6 +212,39 @@ update_tool_config() {
     log_info "日志目录: ${log_dir}"
     log_info "Profiler 原始目录: ${torch_output_dir}/report-sglang"
     log_info "报告目录: ${reports_dir}"
+}
+
+collect_metadata() {
+    local phase="$1"
+    local model_name path_prefix report_prefix trace_dir metadata_dir smi_file
+    model_name=$(yq '.paths.model_name' "$TOOL_CONFIG")
+    path_prefix=$(dirname "$(yq '.paths.torch_output_dir' "$TOOL_CONFIG")")
+    report_prefix=$(yq '.paths.reports_dir' "$TOOL_CONFIG")
+    trace_dir="$(yq '.paths.torch_output_dir' "$TOOL_CONFIG")/report-sglang"
+    metadata_dir="${path_prefix}/sglang-run-metadata"
+    mkdir -p "${PROJECT_ROOT}/${metadata_dir}" "${PROJECT_ROOT}/${report_prefix}"
+    smi_file="${PROJECT_ROOT}/${metadata_dir}/nvidia_smi_${phase}.txt"
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        nvidia-smi >"$smi_file" 2>&1 || true
+    fi
+    if [[ "$DRY_RUN" == "true" ]]; then
+        return 0
+    fi
+    SGLANG_TORCH_PROFILER_LIGHT=$([[ "$TORCH_PROFILER_LIGHT" == "true" ]] && echo 1 || echo 0) \
+    SGLANG_TORCH_PROFILER_WITH_STACK=$([[ "$TORCH_WITH_STACK" == "true" ]] && echo 1 || echo 0) \
+    SGLANG_TORCH_PROFILER_RECORD_SHAPES=$([[ "$TORCH_RECORD_SHAPES" == "true" ]] && echo 1 || echo 0) \
+    SGLANG_TORCH_PROFILER_PROFILE_MEMORY=$([[ "$TORCH_PROFILE_MEMORY" == "true" ]] && echo 1 || echo 0) \
+    SGLANG_TORCH_PROFILER_WITH_MODULES=$([[ "$TORCH_WITH_MODULES" == "true" ]] && echo 1 || echo 0) \
+    "$Python_EXECUTABLE" "${SCRIPT_DIR}/tools/sglang_collect_metadata.py" \
+        --model "$model_name" \
+        --config "$CONFIG_FILE" \
+        --output-dir "${PROJECT_ROOT}/${metadata_dir}" \
+        --report-dir "${PROJECT_ROOT}/${report_prefix}" \
+        --trace-dir "${PROJECT_ROOT}/${trace_dir}" \
+        --rank "0" \
+        --phase "$phase" \
+        --workflow-command "$0 $*" \
+        --nvidia-smi-file "$smi_file" || log_warn "metadata 采集失败: ${phase}"
 }
 
 run_python_runner() {
@@ -216,8 +279,10 @@ main() {
     check_dependencies
     resolve_config_file
     update_tool_config
+    collect_metadata "before"
     patch_sglang_compat
     run_python_runner
+    collect_metadata "after_profile"
 }
 
 main "$@"

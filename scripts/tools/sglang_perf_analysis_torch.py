@@ -124,6 +124,8 @@ class RankStats:
     parsed_events: int = 0
     gpu_kernel_events: int = 0
     profiler_events: int = 0
+    cpu_op_events: int = 0
+    cuda_runtime_events: int = 0
     distributed_events: int = 0
     duplicate_comm_event_filtered_count: int = 0
     distributed: DefaultDict[OpKind, Aggregate] = field(
@@ -155,7 +157,7 @@ class ProfileStats:
         )
 
 
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 
 
 def get_project_root() -> Path:
@@ -541,11 +543,74 @@ def is_comm_text(*parts: str) -> bool:
     )
 
 
+def load_source_map(path: Optional[Path]) -> List[Dict[str, Any]]:
+    if path is None or not path.exists():
+        return []
+    try:
+        if path.suffix.lower() == ".json":
+            data = json.loads(path.read_text(encoding="utf-8"))
+        elif yaml is not None:
+            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        else:
+            data = []
+    except Exception:
+        return []
+    if isinstance(data, dict):
+        data = data.get("mappings", [])
+    return [item for item in data if isinstance(item, dict)]
+
+
+def apply_source_map(
+    source_map: List[Dict[str, Any]],
+    *,
+    kind: OpKind,
+    op_name: str,
+    kernel_name: str,
+    source_file: str,
+) -> Tuple[OpKind, str, str]:
+    haystack = {
+        "kernel_name": kernel_name,
+        "op_name": op_name,
+        "source_file": source_file,
+        "all": " ".join((kernel_name, op_name, source_file)),
+    }
+    for item in source_map:
+        pattern = str(item.get("pattern", ""))
+        if not pattern:
+            continue
+        match_field = str(item.get("match_field", "all"))
+        text = haystack.get(match_field, haystack["all"])
+        try:
+            matched = re.search(pattern, text, flags=re.IGNORECASE) is not None
+        except re.error:
+            matched = pattern.lower() in text.lower()
+        if not matched:
+            continue
+        mapped_kind = kind
+        kind_value = item.get("op_kind")
+        if kind_value:
+            try:
+                mapped_kind = OpKind(str(kind_value))
+            except ValueError:
+                mapped_kind = kind
+        mapped_op = str(item.get("op_name_override") or op_name or "unknown")
+        mapped_source = source_file
+        if not mapped_source and item.get("source_file_guess"):
+            confidence = str(item.get("confidence", "medium"))
+            mapped_source = f"{item.get('source_file_guess')} [source_map:{confidence}]"
+        return mapped_kind, mapped_op, mapped_source
+    return kind, op_name, source_file
+
+
 def cache_paths(output_dir: Optional[Path], rank: int) -> Tuple[Optional[Path], Optional[Path]]:
     if output_dir is None:
         return None, None
     cache_dir = output_dir / "cache"
     return cache_dir / f"rank{rank}_kernel_agg.json", cache_dir / f"rank{rank}_event_hotspot_agg.json"
+
+
+def summary_cache_path(output_dir: Optional[Path], rank: int) -> Optional[Path]:
+    return (output_dir / "cache" / f"rank{rank}_trace_summary.json") if output_dir else None
 
 
 def serialize_aggregate_map(data: Dict[Tuple[str, ...], Aggregate]) -> List[Dict[str, Any]]:
@@ -584,6 +649,8 @@ def load_rank_stats_from_cache(path: Path, rank: int, kernel_cache: Path, event_
     stats.parsed_events = int(kernel_payload.get("parsed_events", 0))
     stats.gpu_kernel_events = int(kernel_payload.get("gpu_kernel_events", 0))
     stats.profiler_events = int(kernel_payload.get("profiler_events", 0))
+    stats.cpu_op_events = int(kernel_payload.get("cpu_op_events", 0))
+    stats.cuda_runtime_events = int(kernel_payload.get("cuda_runtime_events", 0))
     stats.distributed_events = int(kernel_payload.get("distributed_events", 0))
     stats.duplicate_comm_event_filtered_count = int(kernel_payload.get("duplicate_comm_event_filtered_count", 0))
     stats.kernel_aggs = load_aggregate_map(kernel_payload.get("kernel_aggs", []))  # type: ignore[assignment]
@@ -606,6 +673,8 @@ def write_rank_stats_cache(path: Path, stats: RankStats, kernel_cache: Path, eve
         "parsed_events": stats.parsed_events,
         "gpu_kernel_events": stats.gpu_kernel_events,
         "profiler_events": stats.profiler_events,
+        "cpu_op_events": stats.cpu_op_events,
+        "cuda_runtime_events": stats.cuda_runtime_events,
         "distributed_events": stats.distributed_events,
         "duplicate_comm_event_filtered_count": stats.duplicate_comm_event_filtered_count,
     }
@@ -619,6 +688,9 @@ def write_rank_stats_cache(path: Path, stats: RankStats, kernel_cache: Path, eve
     }
     kernel_cache.write_text(json.dumps(kernel_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     event_cache.write_text(json.dumps(event_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    summary_path = summary_cache_path(kernel_cache.parent.parent, stats.rank)
+    if summary_path is not None:
+        summary_path.write_text(json.dumps(common, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def is_gpu_kernel_event(event: Dict[str, Any]) -> bool:
@@ -656,9 +728,11 @@ def update_progress(stats: RankStats, progress_every: int, started_at: float) ->
     elapsed = time.time() - started_at
     print(
         f"[PROGRESS] events={stats.parsed_events:,} "
-        f"gpu_kernel_events={stats.gpu_kernel_events:,} "
-        f"profiler_events={stats.profiler_events:,} "
-        f"distributed_events={stats.distributed_events:,} "
+        f"true_gpu_kernel_events={stats.gpu_kernel_events:,} "
+        f"profiler_event_events={stats.profiler_events:,} "
+        f"cpu_ops={stats.cpu_op_events:,} "
+        f"cuda_runtime={stats.cuda_runtime_events:,} "
+        f"distributed_kernel_events={stats.distributed_events:,} "
         f"elapsed={elapsed:.1f}s "
         f"total_kernel_time_us={stats.total_kernel_us:.0f}",
         file=sys.stderr,
@@ -674,6 +748,7 @@ def parse_trace_file(
     max_events: Optional[int] = None,
     output_dir: Optional[Path] = None,
     use_cache: bool = True,
+    source_map: Optional[List[Dict[str, Any]]] = None,
 ) -> RankStats:
     kernel_cache, event_cache = cache_paths(output_dir, rank)
     if use_cache and kernel_cache is not None and event_cache is not None:
@@ -702,6 +777,10 @@ def parse_trace_file(
 
         cat = str(event.get("cat", ""))
         name = normalize_name(str(event.get("name", "unknown"))).replace("unknow", "unknown")
+        if cat == "cpu_op":
+            rank_stats.cpu_op_events += 1
+        if cat in {"cuda_runtime", "cuda_driver"}:
+            rank_stats.cuda_runtime_events += 1
         if external_key:
             source_from_args = extract_source_from_args(args)
             if source_from_args:
@@ -718,6 +797,13 @@ def parse_trace_file(
             op_name = cpu_op_by_external_id.get(mapped_external_key, "")
             source_file = source_by_external_id.get(mapped_external_key, "") or extract_source_from_args(args)
             kind = classify_op_kind(name, op_name, source_file)
+            kind, op_name, source_file = apply_source_map(
+                source_map or [],
+                kind=kind,
+                op_name=op_name or "unknown",
+                kernel_name=name,
+                source_file=source_file,
+            )
             rank_stats.total_kernel_us += float(dur)
             rank_stats.gpu_kernel_events += 1
             rank_stats.kernel_aggs[(kind.value, op_name or "unknown", name, source_file)].add(float(dur))
@@ -752,6 +838,8 @@ def merge_rank_stats(target: RankStats, source: RankStats) -> None:
     target.parsed_events += source.parsed_events
     target.gpu_kernel_events += source.gpu_kernel_events
     target.profiler_events += source.profiler_events
+    target.cpu_op_events += source.cpu_op_events
+    target.cuda_runtime_events += source.cuda_runtime_events
     target.distributed_events += source.distributed_events
     target.duplicate_comm_event_filtered_count += source.duplicate_comm_event_filtered_count
     target.kernels.extend(source.kernels)
@@ -771,6 +859,7 @@ def parse_profile_dir_by_rank(
     max_events: Optional[int] = None,
     output_dir: Optional[Path] = None,
     use_cache: bool = True,
+    source_map: Optional[List[Dict[str, Any]]] = None,
 ) -> ProfileStats:
     trace_files = sorted(
         set(
@@ -796,6 +885,7 @@ def parse_profile_dir_by_rank(
             max_events=max_events,
             output_dir=output_dir,
             use_cache=use_cache,
+            source_map=source_map,
         )
         if rank not in rank_stats:
             rank_stats[rank] = RankStats(rank=rank)
@@ -979,7 +1069,41 @@ def format_size(path: Path) -> str:
     return f"{size} B"
 
 
+def load_run_metadata(model_name: str) -> Dict[str, Any]:
+    candidates = [
+        get_project_root() / "reports" / model_name / "run_metadata.json",
+    ]
+    cfg = load_tool_config()
+    reports_dir = ((cfg.get("paths") or {}).get("reports_dir"))
+    if reports_dir:
+        candidates.insert(0, resolve_path(reports_dir) / "run_metadata.json")
+    for path in candidates:
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            continue
+    return {}
+
+
+def metadata_value(metadata: Dict[str, Any], section: str, key: str, default: Any = "未采集") -> Any:
+    value = ((metadata.get(section) or {}).get(key) or {})
+    if isinstance(value, dict) and "value" in value:
+        return value.get("value") if value.get("value") not in (None, "") else default
+    return default
+
+
+def profiler_config_summary(metadata: Dict[str, Any]) -> str:
+    trace = metadata.get("trace") or {}
+    profiler = trace.get("profiler_config") or {}
+    if not profiler:
+        return "未采集"
+    return " / ".join(f"{key}={value}" for key, value in profiler.items())
+
+
 def build_environment_rows(profile: ProfileStats, rank_selector: str, model_name: str) -> List[List[str]]:
+    metadata = load_run_metadata(model_name)
     config = load_model_config(model_name)
     scenario = first_scenario(config)
     model_cfg = config.get("model") or {}
@@ -987,11 +1111,29 @@ def build_environment_rows(profile: ProfileStats, rank_selector: str, model_name
     sglang_cfg = config.get("sglang") or {}
     bench_cfg = config.get("benchmark") or {}
     trace = profile.trace_files[0] if profile.trace_files else Path("")
-    cuda_visible = "未采集"
+    cuda_visible = metadata_value(metadata, "gpu", "cuda_visible_devices", default="未采集")
+    gpu_devices = metadata_value(metadata, "gpu", "visible_gpus", default=[])
+    gpu_desc = "未采集"
+    if isinstance(gpu_devices, list) and gpu_devices:
+        gpu_desc = "; ".join(f"{item.get('index')}:{item.get('name')} {item.get('total_memory_mb')}MB" for item in gpu_devices)
+    version_desc = " / ".join(
+        str(value)
+        for value in [
+            metadata_value(metadata, "environment", "python_version", default="Python未采集"),
+            metadata_value(metadata, "environment", "torch_version", default="Torch未采集"),
+            metadata_value(metadata, "environment", "sglang_version", default="SGLang未采集"),
+            metadata_value(metadata, "environment", "triton_version", default="Triton未采集"),
+            metadata_value(metadata, "environment", "flashinfer_version", default="FlashInfer未采集"),
+            metadata_value(metadata, "environment", "deep_gemm_version", default="DeepGEMM未采集"),
+        ]
+    )
     return [
         ["机器", "单机 H20，卡数/单卡显存未采集"],
+        ["GPU", gpu_desc],
         ["框架", "SGLang + Torch profiler"],
+        ["Python/Torch/CUDA/SGLang/Triton/FlashInfer/DeepGEMM 版本", version_desc],
         ["模型名", model_cfg.get("name") or model_name or "未采集"],
+        ["model_path", metadata_value(metadata, "model", "model_path", default=model_cfg.get("path", "未采集"))],
         ["TP size", str(model_cfg.get("tensor_parallel_size", "未采集"))],
         ["dtype / FP8", str(runtime_cfg.get("dtype", "未采集")) + (" / FP8" if "FP8" in model_name.upper() else "")],
         ["CUDA_VISIBLE_DEVICES", cuda_visible],
@@ -1000,10 +1142,54 @@ def build_environment_rows(profile: ProfileStats, rank_selector: str, model_name
         ["gpu_memory_utilization", str(sglang_cfg.get("gpu_memory_utilization", sglang_cfg.get("mem_fraction_static", "未采集")))],
         ["max_num_batched_tokens", str(sglang_cfg.get("max_num_batched_tokens", "未采集"))],
         ["max_num_seqs", str(sglang_cfg.get("max_num_seqs", "未采集"))],
+        ["server_args", metadata_value(metadata, "model", "server_args", default=sglang_cfg.get("extra_args", "未采集"))],
         ["trace 文件路径", str(trace) if trace else "未采集"],
         ["trace 大小", format_size(trace) if trace else "未采集"],
         ["rank", rank_selector],
+        ["profiler 配置 with_stack / record_shapes / profile_memory", profiler_config_summary(metadata)],
     ]
+
+
+def row_value(rows: Sequence[Sequence[str]], key: str, default: str = "未采集") -> str:
+    for row in rows:
+        if len(row) >= 2 and row[0] == key:
+            value = str(row[1])
+            return value if value else default
+    return default
+
+
+def build_mentor_environment_section(env_rows: List[List[str]]) -> List[str]:
+    machine = row_value(env_rows, "机器")
+    framework = row_value(env_rows, "框架")
+    tp_size = row_value(env_rows, "TP size")
+    dtype = row_value(env_rows, "dtype / FP8")
+    scenario = row_value(env_rows, "测试场景")
+    io_runs = row_value(env_rows, "输入长度 / 输出长度 / 并发数 / runs")
+    params = []
+    for key, flag in [
+        ("gpu_memory_utilization", "--gpu_memory_utilization"),
+        ("max_num_batched_tokens", "--max-num-batched-tokens"),
+        ("max_num_seqs", "--max-num-seqs"),
+    ]:
+        value = row_value(env_rows, key)
+        if value != "未采集":
+            params.append(f"{flag} {value}")
+    if not params:
+        server_args = row_value(env_rows, "server_args")
+        if server_args != "未采集":
+            params.append(server_args)
+
+    lines = [
+        "# 环境",
+        "",
+        f"{machine}，{framework}，TP={tp_size}，{dtype}",
+        "",
+        f"参数：{' '.join(params) if params else '未采集'}",
+        "",
+        f"测试场景：{scenario}；输入长度 / 输出长度 / 并发数 / runs：{io_runs}",
+        "",
+    ]
+    return lines
 
 
 def scan_log_summary(model_name: str) -> List[List[str]]:
@@ -1080,6 +1266,43 @@ def build_event_conclusions(event_aggs: List[Tuple[Tuple[str, str, str], Aggrega
     ]
 
 
+def build_unknown_rows(kernel_aggs: List[Tuple[Tuple[str, str, str, str], Aggregate]], limit: int = 50) -> List[List[str]]:
+    rows: List[List[str]] = []
+    for (kind, op_name, kernel_name, source_file), agg in kernel_aggs:
+        if op_name != "unknown" and kind != OpKind.NON_DISTRIBUTED.value and source_file:
+            continue
+        rows.append([
+            md_escape(compact_kernel_name(kernel_name)),
+            str(agg.calls),
+            fmt_ms(agg.total_us),
+            report_type_for(kind, op_name, kernel_name, source_file),
+            md_escape(source_file),
+            "missing cpu_op/source mapping" if op_name == "unknown" or not source_file else "classified as other",
+        ])
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def write_debug_outputs(profile: ProfileStats, output_dir: Path) -> None:
+    debug_dir = output_dir / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    kernel_aggs = aggregate_kernel_aggs(profile)
+    rows = build_unknown_rows(kernel_aggs, limit=100)
+    md = "# Unknown / Unmapped Kernel\n\n" + md_table(
+        ["kernel_name", "调用次数", "总时间(ms)", "guessed_type", "candidate_source", "reason"],
+        rows,
+    )
+    (debug_dir / "rank0_unknown_op_top_kernels.md").write_text(md + "\n", encoding="utf-8")
+    (debug_dir / "rank0_unmapped_top_kernels.md").write_text(md + "\n", encoding="utf-8")
+    payload = {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "unknown_rows": rows,
+        "note": "candidate_profiler_events are not retained in streaming mode to keep memory bounded.",
+    }
+    (debug_dir / "rank0_source_mapping_debug.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def build_type_rows(
     kernel_aggs: List[Tuple[Tuple[str, str, str, str], Aggregate]],
     total_ref: float,
@@ -1130,14 +1353,25 @@ def build_credibility_rows(profile: ProfileStats) -> List[List[str]]:
     unknown_calls = sum(agg.calls for (kind, op_name, _kernel, _source), agg in kernel_aggs if op_name == "unknown" or kind == OpKind.NON_DISTRIBUTED.value)
     unmapped_calls = sum(agg.calls for (_kind, op_name, _kernel, _source), agg in kernel_aggs if op_name == "unknown")
     missing_source_calls = sum(agg.calls for (_kind, _op_name, _kernel, source), agg in kernel_aggs if not source)
+    source_map_calls = sum(agg.calls for (_kind, _op_name, _kernel, source), agg in kernel_aggs if "[source_map:" in source)
+    profiler_source_calls = sum(agg.calls for (_kind, _op_name, _kernel, source), agg in kernel_aggs if source and "[source_map:" not in source)
+    distributed_total = profile.distributed_total_us
     return [
         ["parsed events", f"{parsed_events:,}"],
         ["true_gpu_kernel_events", f"{true_gpu_kernel_events:,}"],
         ["profiler_event_events", f"{profiler_event_events:,}"],
+        ["total_true_gpu_kernel_time_ms", fmt_ms(profile.total_kernel_us)],
+        ["distributed_kernel_time_ms", fmt_ms(distributed_total)],
+        ["distributed_pct", fmt_pct(distributed_total / profile.total_kernel_us if profile.total_kernel_us else 0.0)],
         ["unmapped_kernel_pct", fmt_pct(unmapped_calls / total_calls if total_calls else 0.0)],
         ["unknown_op_pct", fmt_pct(unknown_calls / total_calls if total_calls else 0.0)],
         ["source_file_missing_pct", fmt_pct(missing_source_calls / total_calls if total_calls else 0.0)],
+        ["source_file_from_profiler_pct", fmt_pct(profiler_source_calls / total_calls if total_calls else 0.0)],
+        ["source_file_from_source_map_pct", fmt_pct(source_map_calls / total_calls if total_calls else 0.0)],
         ["duplicate_comm_event_filtered_count", f"{duplicate_comm:,}"],
+        ["duplicate_comm_event_filtered_time_ms", "未采集"],
+        ["cache_used", "见解析日志"],
+        ["parser version", str(CACHE_SCHEMA_VERSION)],
     ]
 
 
@@ -1164,7 +1398,9 @@ def build_op_kernel_rows(
         denom = total_ref if kind.startswith(DISTRIBUTED_PREFIX) else non_comm_ref
         rows.append([
             md_escape(source_file),
+            source_type_for(source_file),
             md_escape(op_name),
+            report_type_for(kind, op_name, "", source_file),
             kernel_text,
             str(calls),
             fmt_ms(total_us),
@@ -1173,6 +1409,30 @@ def build_op_kernel_rows(
             fmt_pct(total_us / total_ref if total_ref > 0 else 0.0),
         ])
     return rows
+
+
+def build_mentor_cuda_rows(detail_rows: List[List[str]]) -> List[List[str]]:
+    rows: List[List[str]] = []
+    for row in detail_rows:
+        rows.append([
+            row[0],
+            row[2],
+            row[4],
+            row[5],
+            row[6],
+            row[7],
+            row[8],
+        ])
+    return rows
+
+
+def source_type_for(source_file: str) -> str:
+    match = re.search(r"\[source_map:([a-z]+)\]", source_file)
+    if match:
+        return f"source_map_{match.group(1)}"
+    if source_file:
+        return "profiler_stack"
+    return "unknown"
 
 
 def build_markdown(
@@ -1195,20 +1455,10 @@ def build_markdown(
     type_rows = build_type_rows(all_kernel_aggs, total_ref, non_comm_ref)
 
     env_rows = build_environment_rows(profile, rank_selector, model_name)
-    lines.append("# 环境与运行配置")
-    lines.append("")
-    lines.append(md_table(["字段", "值"], env_rows))
-    lines.append("")
+    lines.extend(build_mentor_environment_section(env_rows))
     tables.append({"sheet_name": "Environment", "headers": ["字段", "值"], "rows": env_rows})
 
-    log_rows = scan_log_summary(model_name)
-    lines.append("# 显存与运行日志摘要")
-    lines.append("")
-    lines.append(md_table(["字段", "值"], log_rows))
-    lines.append("")
-    tables.append({"sheet_name": "LogSummary", "headers": ["字段", "值"], "rows": log_rows})
-
-    lines.append("# 算子数据")
+    lines.append("## 算子数据")
     lines.append("")
     lines.append("1. 占比说明：Communication / NCCL / all_reduce 使用全部 GPU kernel 总时间作为分母；其它算子默认使用排除通信后的 GPU kernel 总时间作为分母；同时保留 overall_pct。")
     lines.append("2. Torch profiler duration 是事件耗时累计，不完全等同 wall-clock latency。")
@@ -1216,6 +1466,16 @@ def build_markdown(
     lines.append(f"4. parsed events: {parsed_events:,}；true gpu kernel events: {gpu_events:,}。")
     lines.append("5. 本报告 True GPU Kernel 只统计真实 CUDA/NCCL/Triton kernel；fast_trace_kernel_summary.py 的 gpu_events 是 kernel-like 快速过滤口径，会包含更多 CUDA/runtime/Triton/高层相似事件，二者不可直接对齐。")
     lines.append("")
+
+    cuda_detail_rows = build_op_kernel_rows(all_kernel_aggs, total_ref, non_comm_ref, top_kernels_per_op)
+    cuda_rows = build_mentor_cuda_rows(cuda_detail_rows)
+    mentor_kernel_headers = ["source file", "op_name", "kernel_name", "调用次数", "总时间(ms)", "平均时间(us)", "占比"]
+    lines.append("## CUDA kernel（按总时间排序）")
+    lines.append("")
+    lines.append(md_table(mentor_kernel_headers, cuda_rows))
+    lines.append("")
+    tables.append({"sheet_name": "CUDA_GPU_Kernel", "headers": mentor_kernel_headers, "rows": cuda_rows})
+
     credibility_rows = build_credibility_rows(profile)
     lines.append("# 数据可信度说明")
     lines.append("")
@@ -1232,6 +1492,18 @@ def build_markdown(
     lines.append("")
     lines.append("Profiler Event 结论：")
     lines.extend(f"- {line}" for line in build_event_conclusions(event_aggs))
+    lines.append("")
+
+    log_rows = scan_log_summary(model_name)
+    lines.append("# 显存与运行日志摘要")
+    lines.append("")
+    lines.append(md_table(["字段", "值"], log_rows))
+    lines.append("")
+    tables.append({"sheet_name": "LogSummary", "headers": ["字段", "值"], "rows": log_rows})
+
+    lines.append("# 环境与运行配置明细")
+    lines.append("")
+    lines.append(md_table(["字段", "值"], env_rows))
     lines.append("")
 
     overview_rows = [
@@ -1284,12 +1556,12 @@ def build_markdown(
         "rows": dist_rows,
     })
 
-    cuda_rows = build_op_kernel_rows(all_kernel_aggs, total_ref, non_comm_ref, top_kernels_per_op)
-    lines.append("## True GPU Kernel（按总时间排序）")
+    lines.append("## True GPU Kernel 明细（含 source_type / op_kind / overall_pct）")
     lines.append("")
-    lines.append(md_table(["source file", "op_name", "kernel_name", "调用次数", "总时间(ms)", "平均时间(us)", "占比", "overall_pct"], cuda_rows))
+    kernel_headers = ["source file", "source_type", "op_name", "op_kind", "kernel_name", "调用次数", "总时间(ms)", "平均时间(us)", "占比", "overall_pct"]
+    lines.append(md_table(kernel_headers, cuda_detail_rows))
     lines.append("")
-    tables.append({"sheet_name": "CUDA_GPU_Kernel", "headers": ["source file", "op_name", "kernel_name", "调用次数", "总时间(ms)", "平均时间(us)", "占比", "overall_pct"], "rows": cuda_rows})
+    tables.append({"sheet_name": "CUDA_GPU_Kernel_Detail", "headers": kernel_headers, "rows": cuda_detail_rows})
 
     event_rows: List[List[str]] = []
     profiler_total = sum(agg.total_us for _, agg in event_aggs)
@@ -1357,6 +1629,13 @@ def build_markdown(
     lines.append("")
     tables.append({"sheet_name": "TypeAggregation", "headers": ["类型", "调用次数", "总时间(ms)", "平均时间(us)", "overall_pct", "占比"], "rows": type_rows})
 
+    unknown_rows = build_unknown_rows(all_kernel_aggs)
+    lines.append("## Unknown / Unmapped Kernel 附录")
+    lines.append("")
+    lines.append(md_table(["kernel_name", "调用次数", "总时间(ms)", "guessed_type", "candidate_source", "reason"], unknown_rows))
+    lines.append("")
+    tables.append({"sheet_name": "UnknownUnmapped", "headers": ["kernel_name", "调用次数", "总时间(ms)", "guessed_type", "candidate_source", "reason"], "rows": unknown_rows})
+
     rank_rows: List[List[str]] = []
     all_kinds = sorted({kind for rank in profile.rank_stats.values() for kind in rank.distributed}, key=lambda x: x.value)
     for kind in all_kinds:
@@ -1418,6 +1697,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-every", type=int, default=200000, help="每解析多少个 event 输出一次进度，0 表示关闭")
     parser.add_argument("--max-events", type=int, default=None, help="debug 用，最多解析多少个 event")
     parser.add_argument("--no-xlsx", action="store_true", help="只生成 markdown，不写 Excel")
+    parser.add_argument("--use-cache", type=str, default="true", help="是否使用 cache: true/false")
+    parser.add_argument("--force-reparse", type=str, default="false", help="强制重扫 trace: true/false")
+    parser.add_argument("--top-k", type=int, default=200, help="保留参数：Top 表行数")
+    parser.add_argument("--top-kernels-per-op", type=int, default=8, help="每个 op 展示的 kernel_name 数量")
+    parser.add_argument("--source-map", type=str, default=None, help="kernel/source 静态映射 YAML/JSON")
     return parser.parse_args()
 
 
@@ -1428,6 +1712,8 @@ def main() -> int:
     output_dir = resolve_path(args.output_path) if args.output_path else default_output_dir
     report_dir = torch_dir / "report-sglang"
     output_dir.mkdir(parents=True, exist_ok=True)
+    source_map = load_source_map(resolve_path(args.source_map)) if args.source_map else load_source_map(get_project_root() / "scripts" / "tools" / "sglang_kernel_source_map.yaml")
+    use_cache = str(args.use_cache).lower() in {"1", "true", "yes", "on"} and str(args.force_reparse).lower() not in {"1", "true", "yes", "on"}
 
     profile = parse_profile_dir_by_rank(
         report_dir,
@@ -1435,13 +1721,16 @@ def main() -> int:
         progress_every=args.progress_every,
         max_events=args.max_events,
         output_dir=output_dir,
+        use_cache=use_cache,
+        source_map=source_map,
     )
     cfg = load_tool_config()
     model_name = str(((cfg.get("paths") or {}).get("model_name") or infer_model_name(profile) or "unknown"))
-    markdown, tables = build_markdown(profile, args.rank, model_name=model_name)
+    markdown, tables = build_markdown(profile, args.rank, model_name=model_name, top_kernels_per_op=args.top_kernels_per_op)
     md_path = output_dir / "sglang_perf_analysis_torch.md"
     xlsx_path = output_dir / "sglang_perf_analysis_torch.xlsx"
     md_path.write_text(markdown, encoding="utf-8")
+    write_debug_outputs(profile, output_dir)
     if not args.no_xlsx:
         write_excel(xlsx_path, tables)
     print(f"[INFO] Markdown report: {md_path}", flush=True)

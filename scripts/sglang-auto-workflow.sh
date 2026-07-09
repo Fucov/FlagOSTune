@@ -28,6 +28,11 @@ SCENARIO="optimized"
 RUNS_OVERRIDE=""
 TORCH_PROFILE=false
 DRY_RUN=false
+TORCH_WITH_STACK="false"
+TORCH_RECORD_SHAPES="false"
+TORCH_PROFILE_MEMORY="false"
+TORCH_WITH_MODULES="false"
+TORCH_PROFILER_LIGHT="true"
 
 usage() {
     head -12 "$0" | tail -9
@@ -59,6 +64,26 @@ parse_args() {
             --dry-run)
                 DRY_RUN=true
                 shift
+                ;;
+            --torch-with-stack)
+                TORCH_WITH_STACK="$2"
+                shift 2
+                ;;
+            --torch-record-shapes)
+                TORCH_RECORD_SHAPES="$2"
+                shift 2
+                ;;
+            --torch-profile-memory)
+                TORCH_PROFILE_MEMORY="$2"
+                shift 2
+                ;;
+            --torch-with-modules)
+                TORCH_WITH_MODULES="$2"
+                shift 2
+                ;;
+            --torch-profiler-light)
+                TORCH_PROFILER_LIGHT="$2"
+                shift 2
                 ;;
             -h|--help)
                 usage
@@ -109,6 +134,11 @@ main() {
     if [[ "$DRY_RUN" == "true" ]]; then
         args+=("--dry-run")
     fi
+    args+=("--torch-with-stack" "$TORCH_WITH_STACK")
+    args+=("--torch-record-shapes" "$TORCH_RECORD_SHAPES")
+    args+=("--torch-profile-memory" "$TORCH_PROFILE_MEMORY")
+    args+=("--torch-with-modules" "$TORCH_WITH_MODULES")
+    args+=("--torch-profiler-light" "$TORCH_PROFILER_LIGHT")
 
     log_info "SGLang profiling workflow"
     log_info "模型配置: config.yaml.${MODEL_CONFIG}"

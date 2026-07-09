@@ -27,6 +27,11 @@ WORKERS=""
 PROGRESS_EVERY=""
 MAX_EVENTS=""
 NO_XLSX="false"
+USE_CACHE=""
+FORCE_REPARSE=""
+TOP_K=""
+TOP_KERNELS_PER_OP=""
+SOURCE_MAP=""
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -58,6 +63,26 @@ parse_args() {
             --no-xlsx)
                 NO_XLSX="true"
                 shift
+                ;;
+            --use-cache)
+                USE_CACHE="$2"
+                shift 2
+                ;;
+            --force-reparse)
+                FORCE_REPARSE="$2"
+                shift 2
+                ;;
+            --top-k)
+                TOP_K="$2"
+                shift 2
+                ;;
+            --top-kernels-per-op)
+                TOP_KERNELS_PER_OP="$2"
+                shift 2
+                ;;
+            --source-map)
+                SOURCE_MAP="$2"
+                shift 2
                 ;;
             -h|--help)
                 head -4 "$0" | tail -2
@@ -146,6 +171,21 @@ run_analyzer() {
     fi
     if [[ "$NO_XLSX" == "true" ]]; then
         args+=("--no-xlsx")
+    fi
+    if [[ -n "$USE_CACHE" ]]; then
+        args+=("--use-cache" "$USE_CACHE")
+    fi
+    if [[ -n "$FORCE_REPARSE" ]]; then
+        args+=("--force-reparse" "$FORCE_REPARSE")
+    fi
+    if [[ -n "$TOP_K" ]]; then
+        args+=("--top-k" "$TOP_K")
+    fi
+    if [[ -n "$TOP_KERNELS_PER_OP" ]]; then
+        args+=("--top-kernels-per-op" "$TOP_KERNELS_PER_OP")
+    fi
+    if [[ -n "$SOURCE_MAP" ]]; then
+        args+=("--source-map" "$SOURCE_MAP")
     fi
 
     cd "$PROJECT_ROOT"

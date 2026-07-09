@@ -15,6 +15,7 @@ def sample_config(tmp_path: Path) -> dict:
         "current_run": {
             "scenario_type": "optimized",
             "torch_profile": True,
+            "torch_profiler_light": True,
         },
         "model": {
             "path": "/models/DeepSeek-V4-Flash",
@@ -31,6 +32,7 @@ def sample_config(tmp_path: Path) -> dict:
             "extra_args": "--mem-frac 0.82 --attention-backend flashinfer",
         },
         "benchmark": {
+            "dataset_path": "/datasets/local.json",
             "num_runs": 2,
             "scenarios": {
                 "optimized": [
@@ -113,6 +115,41 @@ class SGLangProfileRunnerTest(unittest.TestCase):
             cmd = build_sglang_command(scenario, config, paths.profile_dir, profile=False)
 
         self.assertNotIn("--profile", cmd)
+
+    def test_profiler_options_default_to_light_mode_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = sample_config(Path(tmp))
+
+            from scripts.tools.sglang_profile_runner import build_profiler_env
+
+            env = build_profiler_env(config)
+
+        self.assertEqual(env["SGLANG_TORCH_PROFILER_WITH_STACK"], "0")
+        self.assertEqual(env["SGLANG_TORCH_PROFILER_RECORD_SHAPES"], "0")
+        self.assertEqual(env["SGLANG_TORCH_PROFILER_PROFILE_MEMORY"], "0")
+        self.assertEqual(env["SGLANG_TORCH_PROFILER_WITH_MODULES"], "0")
+
+    def test_profiler_options_can_enable_full_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = sample_config(Path(tmp))
+            config["current_run"].update(
+                {
+                    "torch_profiler_light": False,
+                    "torch_with_stack": True,
+                    "torch_record_shapes": True,
+                    "torch_profile_memory": True,
+                    "torch_with_modules": True,
+                }
+            )
+
+            from scripts.tools.sglang_profile_runner import build_profiler_env
+
+            env = build_profiler_env(config)
+
+        self.assertEqual(env["SGLANG_TORCH_PROFILER_WITH_STACK"], "1")
+        self.assertEqual(env["SGLANG_TORCH_PROFILER_RECORD_SHAPES"], "1")
+        self.assertEqual(env["SGLANG_TORCH_PROFILER_PROFILE_MEMORY"], "1")
+        self.assertEqual(env["SGLANG_TORCH_PROFILER_WITH_MODULES"], "1")
 
     def test_validate_extra_args_rejects_language_only(self) -> None:
         with self.assertRaises(SystemExit):

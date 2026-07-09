@@ -17,7 +17,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
-import yaml
+try:
+    import yaml
+except ImportError:  # pragma: no cover
+    yaml = None
 
 
 DEFAULT_SCENARIO = {
@@ -42,6 +45,8 @@ def load_config(config_path: Path | None = None) -> Dict[str, Any]:
     cfg = config_path or (get_project_root() / "scripts" / "tools" / "sglang_tool_config.yaml")
     if not cfg.exists():
         raise SystemExit(f"[ERROR] 配置文件不存在: {cfg}")
+    if yaml is None:
+        raise SystemExit("[ERROR] 缺少 PyYAML，无法读取 sglang_tool_config.yaml")
     data = yaml.safe_load(cfg.read_text(encoding="utf-8")) or {}
     if not isinstance(data, dict):
         raise SystemExit(f"[ERROR] 配置文件格式非法: {cfg}")
@@ -96,6 +101,28 @@ def add_option(cmd: List[str], name: str, value: Any) -> None:
     if text == "" or text == "null":
         return
     cmd.extend([name, text])
+
+
+def bool_env(value: bool) -> str:
+    return "1" if value else "0"
+
+
+def build_profiler_env(config: Dict[str, Any]) -> Dict[str, str]:
+    current_run = config.get("current_run", {}) or {}
+    light = bool_value(current_run.get("torch_profiler_light", True))
+
+    def flag(name: str, default_when_full: bool = False) -> bool:
+        if light:
+            return False
+        return bool_value(current_run.get(name, default_when_full))
+
+    return {
+        "SGLANG_TORCH_PROFILER_LIGHT": bool_env(light),
+        "SGLANG_TORCH_PROFILER_WITH_STACK": bool_env(flag("torch_with_stack")),
+        "SGLANG_TORCH_PROFILER_RECORD_SHAPES": bool_env(flag("torch_record_shapes")),
+        "SGLANG_TORCH_PROFILER_PROFILE_MEMORY": bool_env(flag("torch_profile_memory")),
+        "SGLANG_TORCH_PROFILER_WITH_MODULES": bool_env(flag("torch_with_modules")),
+    }
 
 def validate_extra_args(extra_args: str) -> List[str]:
     """Parse extra args and reject duplicated core options.
@@ -314,6 +341,7 @@ def run_one_command(
 
     if profile:
         env["SGLANG_TORCH_PROFILER_DIR"] = str(profile_dir)
+        env.update(build_profiler_env(config))
 
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -325,6 +353,8 @@ def run_one_command(
         f.write(f"TRANSFORMERS_OFFLINE={env.get('TRANSFORMERS_OFFLINE', '')}\n")
         if profile:
             f.write(f"SGLANG_TORCH_PROFILER_DIR={profile_dir}\n")
+            for key, value in sorted(build_profiler_env(config).items()):
+                f.write(f"{key}={value}\n")
         f.flush()
 
         result = subprocess.run(

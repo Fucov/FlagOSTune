@@ -246,6 +246,44 @@ class SGLangPerfAnalysisTorchTest(unittest.TestCase):
         self.assertIn("sglang.forward", markdown)
         self.assertIn("FlagOSTune Torch Profiling 之 SGLang Qwen3.6-35B-A3B-FP8 TP4", markdown)
 
+    def test_markdown_front_section_matches_mentor_profile_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report-sglang"
+            report_dir.mkdir()
+            write_trace(
+                report_dir / "worker-rank0.pt.trace.json",
+                [
+                    cpu_op_event("aten::scaled_dot_product_attention", 1),
+                    profiler_event("scheduler.run_batch", "user_annotation", 500.0, 1),
+                    kernel_event("flashinfer_attention_kernel", 80.0, 1),
+                ],
+            )
+
+            profile = parse_profile_dir_by_rank(
+                report_dir,
+                rank_selector="0",
+                progress_every=0,
+                use_cache=False,
+            )
+            markdown, _ = build_markdown(profile, "0", model_name="Qwen3.6-35B-A3B-FP8-TP4-P32768D1024C1")
+
+        env_idx = markdown.index("# 环境")
+        op_idx = markdown.index("## 算子数据")
+        cuda_idx = markdown.index("## CUDA kernel（按总时间排序）")
+        credibility_idx = markdown.index("# 数据可信度说明")
+
+        self.assertLess(env_idx, op_idx)
+        self.assertLess(op_idx, cuda_idx)
+        self.assertLess(cuda_idx, credibility_idx)
+
+        front_cuda_section = markdown.split("## CUDA kernel（按总时间排序）", 1)[1].split("# 数据可信度说明", 1)[0]
+        self.assertIn("| source file | op_name | kernel_name | 调用次数 | 总时间(ms) | 平均时间(us) | 占比 |", front_cuda_section)
+        self.assertIn("flashinfer_attention_kernel", front_cuda_section)
+        self.assertNotIn("scheduler.run_batch", front_cuda_section)
+        self.assertNotIn("source_type", front_cuda_section)
+        self.assertNotIn("overall_pct", front_cuda_section)
+        self.assertIn("## True GPU Kernel 明细", markdown)
+
     def test_parse_profile_dir_by_rank_reuses_cache_when_trace_metadata_matches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

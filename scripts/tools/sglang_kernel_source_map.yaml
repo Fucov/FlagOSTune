@@ -1,0 +1,55 @@
+mappings:
+  - pattern: "sglang::outplace_all_reduce|all_reduce_one_shot_push_kernel|custom_all_reduce|outplace_all_reduce|ncclDevKernel_AllReduce|ncclDevKernel_AllGather"
+    match_field: all
+    op_kind: distributed_nccl_other
+    source_file_guess: "sglang/srt/distributed/communication_op.py"
+    confidence: medium
+    note: "SGLang/NCCL communication kernels"
+  - pattern: "sglang::outplace_fused_experts|fused_moe_kernel|moe_align_block_size|count_and_sort_expert_tokens_kernel|topkGatingSoftmax|sgl_kernel::topk_softmax|sgl_kernel::moe_sum_reduce"
+    match_field: all
+    op_kind: moe
+    source_file_guess: "sglang/srt/layers/moe/"
+    confidence: medium
+    note: "MoE expert routing and fused experts"
+  - pattern: "sglang::deep_gemm_fp8_fp8_bf16_nt|deep_gemm::sm90_fp8_gemm|deep_gemm"
+    match_field: all
+    op_kind: gemm
+    source_file_guess: "sglang/srt/layers/deep_gemm_wrapper/entrypoint.py"
+    confidence: medium
+    note: "DeepGEMM / FP8 GEMM"
+  - pattern: "per_token_group_quant_8bit_v2|fp8.*quant|quant.*fp8"
+    match_field: all
+    op_kind: non_distributed
+    source_file_guess: "sglang/jit_kernel/per_token_group_quant_8bit_v2.py"
+    confidence: medium
+    note: "FP8 quantization kernels"
+  - pattern: "flashinfernorm|fused_add_rmsnorm|RMSNormKernel|LayerNormFn|_layer_norm_fwd_1pass_kernel"
+    match_field: all
+    op_kind: norm
+    source_file_guess: "sglang/srt/layers/layernorm.py"
+    confidence: medium
+    note: "Norm / fused norm kernels"
+  - pattern: "fused_qkvzba_split_reshape_cat_contiguous|create_flashinfer_kv_indices_triton|get_num_kv_splits_triton|radix_attention|flash_attn|flashinfer"
+    match_field: all
+    op_kind: non_distributed
+    source_file_guess: "sglang/srt/layers/attention/"
+    confidence: medium
+    note: "Attention kernels"
+  - pattern: "fused_qkv_split_gdn_prefill|fused_recurrent_gated_delta_rule|causal_conv1d|track_mamba_state|chunk_gated_delta_rule|gdn_backend|gated_delta"
+    match_field: all
+    op_kind: mamba_or_linear_attention
+    source_file_guess: "sglang/srt/layers/attention/linear/"
+    confidence: medium
+    note: "Linear attention / Mamba kernels"
+  - pattern: "store_kvcache|sglang::store_cache|reshape_and_cache|kvcache"
+    match_field: all
+    op_kind: kv_cache
+    source_file_guess: "sglang/srt/mem_cache/"
+    confidence: medium
+    note: "KV cache kernels"
+  - pattern: "mrope|rope|rotary|compute_position|clamp_position"
+    match_field: all
+    op_kind: attention
+    source_file_guess: "sglang/srt/layers/rotary_embedding.py"
+    confidence: low
+    note: "RoPE / position kernels; report_type fallback maps to RoPE/Position"
