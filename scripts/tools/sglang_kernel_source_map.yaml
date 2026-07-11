@@ -1,10 +1,22 @@
 mappings:
-  - pattern: "sglang::outplace_all_reduce|all_reduce_one_shot_push_kernel|custom_all_reduce|outplace_all_reduce|ncclDevKernel_AllReduce|ncclDevKernel_AllGather"
+  - pattern: "sglang::outplace_all_reduce|all_reduce_one_shot_push_kernel|all_reduce_one_shot_kernel|all_reduce_two_shot_kernel|custom_all_reduce|outplace_all_reduce"
     match_field: all
-    op_kind: distributed_nccl_other
-    source_file_guess: "sglang/srt/distributed/communication_op.py"
+    op_kind: distributed_all_reduce
+    source_file_guess: "sglang/srt/distributed/parallel_state.py"
     confidence: medium
-    note: "SGLang/NCCL communication kernels"
+    note: "SGLang custom all-reduce dispatch/JIT path; not NCCL"
+  - pattern: "ncclDevKernel_AllReduce"
+    match_field: kernel_name
+    op_kind: distributed_all_reduce
+    source_file_guess: "sglang/srt/distributed/device_communicators/pynccl.py"
+    confidence: medium
+    note: "NCCL all-reduce; may also enter through torch.distributed fallback"
+  - pattern: "ncclDevKernel_AllGather"
+    match_field: kernel_name
+    op_kind: distributed_all_gather
+    source_file_guess: "sglang/srt/distributed/device_communicators/pynccl.py"
+    confidence: medium
+    note: "NCCL all-gather; may also enter through torch.distributed fallback"
   - pattern: "sglang::outplace_fused_experts|fused_moe_kernel|moe_align_block_size|count_and_sort_expert_tokens_kernel|topkGatingSoftmax|sgl_kernel::topk_softmax|sgl_kernel::moe_sum_reduce"
     match_field: all
     op_kind: moe

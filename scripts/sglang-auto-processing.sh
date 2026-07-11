@@ -143,6 +143,7 @@ main() {
         args+=("--source-map" "$SOURCE_MAP")
     fi
     log_info "SGLang processing workflow"
+    log_info "启用严格 metadata 一致性检查（config / trace / run_metadata / report）"
     log_step "分析 SGLang Torch profiler 数据"
     "${SCRIPT_DIR}/sglang-run-processing.sh" "${args[@]}"
     log_info "完成"

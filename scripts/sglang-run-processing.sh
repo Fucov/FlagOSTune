@@ -135,6 +135,10 @@ update_tool_config() {
 
     local model_name paths_results paths_reports paths_use_model_name path_prefix report_prefix
     model_name=$(yq '.model.name // "default"' "$CONFIG_FILE")
+    if [[ -n "$MODEL_CONFIG" && "$MODEL_CONFIG" != "$model_name" ]]; then
+        log_error "metadata mismatch: requested model does not match config model"
+        exit 1
+    fi
     paths_results=$(yq '.paths.results // "results"' "$CONFIG_FILE")
     paths_reports=$(yq '.paths.reports // "reports"' "$CONFIG_FILE")
     paths_use_model_name=$(yq '.paths.use_model_name // true' "$CONFIG_FILE")
@@ -155,11 +159,29 @@ update_tool_config() {
 }
 
 run_analyzer() {
-    local torch_output_dir reports_dir
+    local torch_output_dir reports_dir model_name scenario_name tp_size run_metadata_path
     torch_output_dir=$(yq '.paths.torch_output_dir' "$TOOL_CONFIG")
     reports_dir=$(yq '.paths.reports_dir' "$TOOL_CONFIG")
+    model_name=$(yq '.model.name // ""' "$CONFIG_FILE")
+    scenario_name=$(yq '.benchmark.scenarios.optimized[0].name // ""' "$CONFIG_FILE")
+    tp_size=$(yq '.model.tensor_parallel_size // 0' "$CONFIG_FILE")
+    run_metadata_path="${reports_dir}/run_metadata.json"
 
-    local args=("--torch_path" "$torch_output_dir" "--output_path" "$reports_dir" "--rank" "$RANK")
+    if [[ -z "$model_name" || -z "$scenario_name" || ! "$tp_size" =~ ^[0-9]+$ || "$tp_size" == "0" ]]; then
+        log_error "metadata mismatch: config model/scenario/tp_size is incomplete"
+        exit 1
+    fi
+
+    local args=(
+        "--torch_path" "$torch_output_dir"
+        "--output_path" "$reports_dir"
+        "--rank" "$RANK"
+        "--config-path" "$CONFIG_FILE"
+        "--expected-model" "$model_name"
+        "--expected-scenario" "$scenario_name"
+        "--expected-tp-size" "$tp_size"
+        "--run-metadata" "$run_metadata_path"
+    )
     if [[ -n "$WORKERS" ]]; then
         args+=("--workers" "$WORKERS")
     fi

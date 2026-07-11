@@ -26,6 +26,17 @@ try:
 except ImportError:  # pragma: no cover
     Workbook = None
 
+try:
+    from .sglang_comm_report_formatter import (
+        build_focus_report_sections,
+        load_kernel_mappings,
+    )
+except ImportError:  # Direct script execution.
+    from sglang_comm_report_formatter import (  # type: ignore
+        build_focus_report_sections,
+        load_kernel_mappings,
+    )
+
 
 class OpKind(str, Enum):
     DISTRIBUTED_ALL_REDUCE = "distributed_all_reduce"
@@ -34,7 +45,7 @@ class OpKind(str, Enum):
     DISTRIBUTED_ALL_TO_ALL = "distributed_all_to_all"
     DISTRIBUTED_BROADCAST = "distributed_broadcast"
     DISTRIBUTED_P2P = "distributed_p2p"
-    DISTRIBUTED_NCCL_OTHER = "distributed_nccl_other"
+    DISTRIBUTED_OTHER = "distributed_other"
     ATTENTION = "attention"
     MOE = "moe"
     GEMM = "gemm"
@@ -52,7 +63,7 @@ class OpKind(str, Enum):
     ALL_TO_ALL = "distributed_all_to_all"
     BROADCAST = "distributed_broadcast"
     SEND_RECV = "distributed_p2p"
-    OTHER_DISTRIBUTED = "distributed_nccl_other"
+    OTHER_DISTRIBUTED = "distributed_other"
 
 
 # Backward-compatible export name used by existing tests/callers.
@@ -157,7 +168,7 @@ class ProfileStats:
         )
 
 
-CACHE_SCHEMA_VERSION = 3
+CACHE_SCHEMA_VERSION = 4
 
 
 def get_project_root() -> Path:
@@ -272,9 +283,9 @@ def classify_op_kind(
     if re.search(r"(^|[^a-z])(send|recv)([^a-z]|$)", text):
         return OpKind.DISTRIBUTED_P2P
     if "nccl" in text:
-        return OpKind.DISTRIBUTED_NCCL_OTHER
+        return OpKind.DISTRIBUTED_OTHER
     if has_keyword(text, compact, "processgroup", "c10d", "record_param_comms", "custom_ar"):
-        return OpKind.DISTRIBUTED_NCCL_OTHER
+        return OpKind.DISTRIBUTED_OTHER
 
     if has_keyword(text, compact, "rms_norm", "rmsnorm", "layer_norm", "layernorm", "l2norm", "fused_add_rmsnorm", "normkernel", "norm"):
         return OpKind.NORM
@@ -795,7 +806,11 @@ def parse_trace_file(
         if is_gpu_kernel_event(event):
             mapped_external_key = external_key or runtime_external_by_correlation.get(correlation_key, "")
             op_name = cpu_op_by_external_id.get(mapped_external_key, "")
-            source_file = source_by_external_id.get(mapped_external_key, "") or extract_source_from_args(args)
+            direct_source = extract_source_from_args(args)
+            correlated_source = source_by_external_id.get(mapped_external_key, "")
+            source_file = direct_source or correlated_source
+            if not direct_source and correlated_source:
+                source_file = f"{correlated_source} [correlation]"
             kind = classify_op_kind(name, op_name, source_file)
             kind, op_name, source_file = apply_source_map(
                 source_map or [],
@@ -851,16 +866,7 @@ def merge_rank_stats(target: RankStats, source: RankStats) -> None:
         target.event_hotspots[key].add(agg.total_us, agg.calls)
 
 
-def parse_profile_dir_by_rank(
-    report_dir: Path,
-    rank_selector: str = "0",
-    *,
-    progress_every: int = 200000,
-    max_events: Optional[int] = None,
-    output_dir: Optional[Path] = None,
-    use_cache: bool = True,
-    source_map: Optional[List[Dict[str, Any]]] = None,
-) -> ProfileStats:
+def select_trace_files(report_dir: Path, rank_selector: str) -> List[Path]:
     trace_files = sorted(
         set(
             list(report_dir.glob("*.pt.trace.json"))
@@ -872,6 +878,20 @@ def parse_profile_dir_by_rank(
     trace_files = [path for path in trace_files if rank_matches(path, rank_selector)]
     if not trace_files:
         raise SystemExit(f"Missing SGLang trace file in {report_dir} for rank={rank_selector}")
+    return trace_files
+
+
+def parse_profile_dir_by_rank(
+    report_dir: Path,
+    rank_selector: str = "0",
+    *,
+    progress_every: int = 200000,
+    max_events: Optional[int] = None,
+    output_dir: Optional[Path] = None,
+    use_cache: bool = True,
+    source_map: Optional[List[Dict[str, Any]]] = None,
+) -> ProfileStats:
+    trace_files = select_trace_files(report_dir, rank_selector)
 
     rank_stats: Dict[int, RankStats] = {}
     for trace_file in trace_files:
@@ -965,13 +985,6 @@ def aggregate_event_hotspots(profile: ProfileStats) -> List[Tuple[Tuple[str, str
 
 
 REPORT_TYPE_LABELS = {
-    OpKind.DISTRIBUTED_ALL_REDUCE.value: "Communication/NCCL",
-    OpKind.DISTRIBUTED_ALL_GATHER.value: "Communication/NCCL",
-    OpKind.DISTRIBUTED_REDUCE_SCATTER.value: "Communication/NCCL",
-    OpKind.DISTRIBUTED_ALL_TO_ALL.value: "Communication/NCCL",
-    OpKind.DISTRIBUTED_BROADCAST.value: "Communication/NCCL",
-    OpKind.DISTRIBUTED_P2P.value: "Communication/NCCL",
-    OpKind.DISTRIBUTED_NCCL_OTHER.value: "Communication/NCCL",
     OpKind.MOE.value: "MoE/Expert",
     OpKind.ATTENTION.value: "Attention",
     OpKind.MAMBA_OR_LINEAR_ATTENTION.value: "Linear Attention / Mamba",
@@ -983,10 +996,29 @@ REPORT_TYPE_LABELS = {
 
 
 def report_type_for(kind: str, op_name: str, kernel_name: str, source_file: str) -> str:
+    text, compact = normalized_search_text(kernel_name, op_name, source_file)
+    if kind.startswith(DISTRIBUTED_PREFIX):
+        if has_keyword(
+            text,
+            compact,
+            "all_reduce_one_shot",
+            "all_reduce_two_shot",
+            "custom_all_reduce",
+            "custom_ar",
+            "outplace_all_reduce",
+            "cross_device_reduce",
+        ) and "nccldevkernel" not in compact:
+            return "Communication/SGLang Custom AllReduce"
+        if "nccl" in text:
+            return "Communication/NCCL"
+        if "gloo" in text or "control" in text:
+            return "Communication/Control Plane"
+        if "flashinfer" in text and ("comm" in text or "allreduce_fusion" in text):
+            return "Communication/Fused Possible"
+        return "Communication/Other"
     label = REPORT_TYPE_LABELS.get(kind)
     if label:
         return label
-    text, compact = normalized_search_text(kernel_name, op_name, source_file)
     if has_keyword(text, compact, "rope", "rotary", "position", "mrope"):
         return "RoPE/Position"
     if has_keyword(text, compact, "quant", "dequant", "per_token_group_quant", "fp8", "int8"):
@@ -1043,6 +1075,140 @@ def first_scenario(config: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(value, list) and value:
             return value[0] or {}
     return {}
+
+
+class MetadataMismatchError(RuntimeError):
+    """Raised before report generation when run identity is inconsistent."""
+
+
+def _metadata_unwrap(value: Any) -> Any:
+    if isinstance(value, dict) and "value" in value:
+        return value.get("value")
+    return value
+
+
+def _metadata_nested(metadata: Dict[str, Any], section: str, key: str) -> Any:
+    section_value = metadata.get(section) or {}
+    if not isinstance(section_value, dict):
+        return None
+    return _metadata_unwrap(section_value.get(key))
+
+
+def _scenario_identity(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _model_tp_size(model_name: str) -> Optional[int]:
+    match = re.search(r"(?:^|-)TP(\d+)(?:-|$)", model_name, flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _model_scenario_identity(model_name: str) -> str:
+    match = re.search(r"(?:^|-)P(\d+)D(\d+)C(\d+)(?:-|$)", model_name, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return _scenario_identity(f"p{match.group(1)}d{match.group(2)}c{match.group(3)}")
+
+
+def _trace_model_name(path: Path) -> str:
+    parts = path.resolve().parts
+    indices = [index for index, part in enumerate(parts) if part == "results"]
+    if not indices:
+        return ""
+    index = indices[-1]
+    return parts[index + 1] if index + 1 < len(parts) else ""
+
+
+def _metadata_error(message: str) -> MetadataMismatchError:
+    return MetadataMismatchError(f"metadata mismatch: {message}")
+
+
+def validate_report_metadata(
+    *,
+    config_path: Path,
+    trace_files: Sequence[Path],
+    output_dir: Path,
+    run_metadata_path: Path,
+    expected_model: str,
+    expected_scenario: str,
+    expected_tp_size: int,
+) -> Dict[str, Any]:
+    """Validate config, report, trace and collected run metadata identities."""
+    if not config_path.is_file():
+        raise _metadata_error(f"config is missing: {config_path}")
+    try:
+        config_text = config_path.read_text(encoding="utf-8")
+        config = (
+            yaml.safe_load(config_text)
+            if yaml is not None
+            else json.loads(config_text)
+        ) or {}
+    except Exception as exc:
+        raise _metadata_error(f"cannot read config: {config_path}: {exc}") from exc
+    if not isinstance(config, dict):
+        raise _metadata_error(f"config is not a mapping: {config_path}")
+
+    config_model = str(((config.get("model") or {}).get("name") or ""))
+    config_tp = int(((config.get("model") or {}).get("tensor_parallel_size") or 0))
+    scenario = first_scenario(config)
+    config_scenario = str(scenario.get("name") or "")
+    if config_model != expected_model:
+        raise _metadata_error("report model does not match config model")
+    if config_tp != int(expected_tp_size):
+        raise _metadata_error("report TP size does not match config TP size")
+    if _scenario_identity(config_scenario) != _scenario_identity(expected_scenario):
+        raise _metadata_error("report scenario does not match config scenario")
+
+    if output_dir.name != expected_model:
+        raise _metadata_error("report model does not match output path")
+    for trace_path in trace_files:
+        trace_model = _trace_model_name(trace_path)
+        if trace_model and trace_model != expected_model:
+            raise _metadata_error("report model does not match trace path")
+
+    embedded_tp = _model_tp_size(expected_model)
+    if embedded_tp is not None and embedded_tp != int(expected_tp_size):
+        raise _metadata_error("report TP size does not match model name")
+    embedded_scenario = _model_scenario_identity(expected_model)
+    if embedded_scenario and embedded_scenario != _scenario_identity(expected_scenario):
+        raise _metadata_error("report scenario does not match model name")
+
+    if not run_metadata_path.is_file():
+        raise _metadata_error("run_metadata.json is missing")
+    try:
+        metadata = json.loads(run_metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise _metadata_error(f"cannot read run_metadata.json: {exc}") from exc
+    if not isinstance(metadata, dict):
+        raise _metadata_error("run_metadata.json is not an object")
+
+    if str(_metadata_nested(metadata, "model", "model_name") or "") != expected_model:
+        raise _metadata_error("report model does not match run_metadata.json")
+    metadata_tp = _metadata_nested(metadata, "model", "tp_size")
+    if int(metadata_tp or 0) != int(expected_tp_size):
+        raise _metadata_error("report TP size does not match run_metadata.json")
+    metadata_scenario = _metadata_nested(metadata, "benchmark", "scenario_name")
+    if _scenario_identity(metadata_scenario) != _scenario_identity(expected_scenario):
+        raise _metadata_error("report scenario does not match run_metadata.json")
+
+    metadata_traces = _metadata_nested(metadata, "trace", "trace_files") or []
+    recorded_paths = {
+        str(Path(item.get("path", "")).resolve())
+        for item in metadata_traces
+        if isinstance(item, dict) and item.get("path")
+    }
+    for trace_path in trace_files:
+        if str(trace_path.resolve()) not in recorded_paths:
+            raise _metadata_error("selected trace path is not recorded in run_metadata.json")
+
+    return {
+        "model_name": expected_model,
+        "scenario": expected_scenario,
+        "tp_size": int(expected_tp_size),
+        "config_path": str(config_path),
+        "run_metadata_path": str(run_metadata_path),
+        "trace_files": [str(path) for path in trace_files],
+    }
 
 
 def infer_model_name(profile: ProfileStats) -> str:
@@ -1236,14 +1402,15 @@ def build_gpu_conclusions(kernel_aggs: List[Tuple[Tuple[str, str, str, str], Agg
     if type_totals:
         dominant = max(type_totals, key=lambda item: item[1])
         conclusions.append(f"{dominant[0]} 是当前 rank 中总时间最高的类型，累计 {dominant[1]:.3f} ms。")
-    comm = [row for row in type_rows if row[0] == "Communication/NCCL" and row[2] != "0.000"]
+    comm = [row for row in type_rows if row[0].startswith("Communication/") and row[2] != "0.000"]
     if comm:
-        conclusions.append(f"通信类 kernel 占全部 GPU kernel 总时间 {comm[0][4]}，后续需要重点观察 TP 通信与计算重叠。")
+        comm_ms = sum(float(row[2]) for row in comm)
+        conclusions.append(f"通信类 kernel 合计 {comm_ms:.3f} ms；custom all-reduce 与 NCCL 已分开统计。")
     top_names = [compact_kernel_name(item[0][2], 120) for item in kernel_aggs[:3]]
     conclusions.append(f"Top1 kernel 为 `{top_names[0]}`；Top3 由 {'; '.join('`' + name + '`' for name in top_names)} 构成。")
     labels = {row[0]: float(row[2]) for row in type_rows}
-    focus = max(("MoE/Expert", "Attention", "Linear Attention / Mamba", "GEMM/Linear", "Communication/NCCL"), key=lambda name: labels.get(name, 0.0))
-    conclusions.append(f"MoE / Attention / GEMM / NCCL 中，{focus} 在表格聚合中占主导。")
+    focus = max(("MoE/Expert", "Attention", "Linear Attention / Mamba", "GEMM/Linear", "Communication/SGLang Custom AllReduce", "Communication/NCCL"), key=lambda name: labels.get(name, 0.0))
+    conclusions.append(f"MoE / Attention / GEMM / communication 中，{focus} 在表格聚合中占主导。")
     if focus in {"MoE/Expert", "GEMM/Linear"}:
         conclusions.append("FlagTree/Triton/megakernel 优化优先看专家计算、GEMM 形状合并和 launch 开销。")
     elif focus == "Attention":
@@ -1309,7 +1476,11 @@ def build_type_rows(
     non_comm_ref: float,
 ) -> List[List[str]]:
     type_order = [
+        "Communication/SGLang Custom AllReduce",
         "Communication/NCCL",
+        "Communication/Control Plane",
+        "Communication/Fused Possible",
+        "Communication/Other",
         "MoE/Expert",
         "Attention",
         "Linear Attention / Mamba",
@@ -1331,7 +1502,7 @@ def build_type_rows(
     type_rows: List[List[str]] = []
     for label in type_order:
         agg = type_aggs[label]
-        denom = total_ref if label == "Communication/NCCL" else non_comm_ref
+        denom = total_ref if label.startswith("Communication/") else non_comm_ref
         type_rows.append([
             label,
             str(agg.calls),
@@ -1354,7 +1525,12 @@ def build_credibility_rows(profile: ProfileStats) -> List[List[str]]:
     unmapped_calls = sum(agg.calls for (_kind, op_name, _kernel, _source), agg in kernel_aggs if op_name == "unknown")
     missing_source_calls = sum(agg.calls for (_kind, _op_name, _kernel, source), agg in kernel_aggs if not source)
     source_map_calls = sum(agg.calls for (_kind, _op_name, _kernel, source), agg in kernel_aggs if "[source_map:" in source)
-    profiler_source_calls = sum(agg.calls for (_kind, _op_name, _kernel, source), agg in kernel_aggs if source and "[source_map:" not in source)
+    correlation_source_calls = sum(agg.calls for (_kind, _op_name, _kernel, source), agg in kernel_aggs if "[correlation]" in source)
+    profiler_source_calls = sum(
+        agg.calls
+        for (_kind, _op_name, _kernel, source), agg in kernel_aggs
+        if source and "[source_map:" not in source and "[correlation]" not in source
+    )
     distributed_total = profile.distributed_total_us
     return [
         ["parsed events", f"{parsed_events:,}"],
@@ -1367,6 +1543,7 @@ def build_credibility_rows(profile: ProfileStats) -> List[List[str]]:
         ["unknown_op_pct", fmt_pct(unknown_calls / total_calls if total_calls else 0.0)],
         ["source_file_missing_pct", fmt_pct(missing_source_calls / total_calls if total_calls else 0.0)],
         ["source_file_from_profiler_pct", fmt_pct(profiler_source_calls / total_calls if total_calls else 0.0)],
+        ["source_file_from_correlation_pct", fmt_pct(correlation_source_calls / total_calls if total_calls else 0.0)],
         ["source_file_from_source_map_pct", fmt_pct(source_map_calls / total_calls if total_calls else 0.0)],
         ["duplicate_comm_event_filtered_count", f"{duplicate_comm:,}"],
         ["duplicate_comm_event_filtered_time_ms", "未采集"],
@@ -1427,6 +1604,8 @@ def build_mentor_cuda_rows(detail_rows: List[List[str]]) -> List[List[str]]:
 
 
 def source_type_for(source_file: str) -> str:
+    if "[correlation]" in source_file:
+        return "correlation"
     match = re.search(r"\[source_map:([a-z]+)\]", source_file)
     if match:
         return f"source_map_{match.group(1)}"
@@ -1441,6 +1620,7 @@ def build_markdown(
     *,
     model_name: str = "",
     top_kernels_per_op: int = 8,
+    comm_mappings: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     model_name = model_name or infer_model_name(profile) or "unknown"
     lines: List[str] = [mentor_title(model_name), ""]
@@ -1476,14 +1656,49 @@ def build_markdown(
     lines.append("")
     tables.append({"sheet_name": "CUDA_GPU_Kernel", "headers": mentor_kernel_headers, "rows": cuda_rows})
 
+    if comm_mappings is None:
+        comm_mappings = load_kernel_mappings(
+            get_project_root() / "scripts" / "tools" / "sglang_comm_kernel_mapping.yaml"
+        )
+    focus_kernel_rows = [
+        {
+            "kind": kind,
+            "op_name": op_name,
+            "kernel_name": kernel_name,
+            "source_file": source_file,
+            "calls": agg.calls,
+            "total_us": agg.total_us,
+        }
+        for (kind, op_name, kernel_name, source_file), agg in all_kernel_aggs
+    ]
+    focus_event_rows = [
+        {
+            "event_type": event_type,
+            "source_file": source_file,
+            "event_name": event_name,
+            "calls": agg.calls,
+            "total_us": agg.total_us,
+        }
+        for (event_type, source_file, event_name), agg in event_aggs
+    ]
+    focus_markdown, focus_tables = build_focus_report_sections(
+        kernel_rows=focus_kernel_rows,
+        event_rows=focus_event_rows,
+        total_gpu_us=total_ref,
+        mappings=comm_mappings,
+    )
+
     credibility_rows = build_credibility_rows(profile)
     lines.append("# 数据可信度说明")
     lines.append("")
     lines.append(md_table(["字段", "值"], credibility_rows))
     lines.append("")
-    lines.append("说明：如果 trace 不包含 stack 或 launch correlation，source_file 可能为空；unknown_op_pct 越高，表示 kernel 到 cpu_op 的关联越不完整。")
+    lines.append("说明：如果 trace 不包含 stack 或 launch correlation，source_file 可能为空；unknown_op_pct 越高，表示 kernel 到 cpu_op 的关联越不完整。source_map 是候选源码路径，不是 profiler 原生 stack。")
     lines.append("")
     tables.append({"sheet_name": "Credibility", "headers": ["字段", "值"], "rows": credibility_rows})
+
+    lines.append(focus_markdown)
+    tables.extend(focus_tables)
 
     lines.append("# 核心结论")
     lines.append("")
@@ -1702,6 +1917,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=200, help="保留参数：Top 表行数")
     parser.add_argument("--top-kernels-per-op", type=int, default=8, help="每个 op 展示的 kernel_name 数量")
     parser.add_argument("--source-map", type=str, default=None, help="kernel/source 静态映射 YAML/JSON")
+    parser.add_argument("--config-path", type=str, default=None, help="本次报告使用的模型配置文件")
+    parser.add_argument("--expected-model", type=str, default=None, help="launcher 解析出的模型名")
+    parser.add_argument("--expected-scenario", type=str, default=None, help="launcher 解析出的场景名")
+    parser.add_argument("--expected-tp-size", type=int, default=None, help="launcher 解析出的 TP size")
+    parser.add_argument("--run-metadata", type=str, default=None, help="本次运行的 run_metadata.json")
     return parser.parse_args()
 
 
@@ -1711,8 +1931,50 @@ def main() -> int:
     torch_dir = resolve_path(args.torch_path) if args.torch_path else default_torch_dir
     output_dir = resolve_path(args.output_path) if args.output_path else default_output_dir
     report_dir = torch_dir / "report-sglang"
+    cfg = load_tool_config()
+    configured_model = str(((cfg.get("paths") or {}).get("model_name") or ""))
+    expected_model = str(args.expected_model or configured_model)
+    config_path = (
+        resolve_path(args.config_path)
+        if args.config_path
+        else find_config_for_model(expected_model)
+    )
+    if config_path is None:
+        print("[ERROR] metadata mismatch: config is missing", file=sys.stderr, flush=True)
+        return 2
+    config = load_model_config(expected_model)
+    scenario = first_scenario(config)
+    expected_scenario = str(args.expected_scenario or scenario.get("name") or "")
+    expected_tp_size = int(
+        args.expected_tp_size
+        if args.expected_tp_size is not None
+        else ((config.get("model") or {}).get("tensor_parallel_size") or 0)
+    )
+    run_metadata_path = (
+        resolve_path(args.run_metadata)
+        if args.run_metadata
+        else output_dir / "run_metadata.json"
+    )
+    selected_trace_files = select_trace_files(report_dir, args.rank)
+    try:
+        validated_identity = validate_report_metadata(
+            config_path=config_path,
+            trace_files=selected_trace_files,
+            output_dir=output_dir,
+            run_metadata_path=run_metadata_path,
+            expected_model=expected_model,
+            expected_scenario=expected_scenario,
+            expected_tp_size=expected_tp_size,
+        )
+    except MetadataMismatchError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr, flush=True)
+        return 2
+
     output_dir.mkdir(parents=True, exist_ok=True)
     source_map = load_source_map(resolve_path(args.source_map)) if args.source_map else load_source_map(get_project_root() / "scripts" / "tools" / "sglang_kernel_source_map.yaml")
+    comm_mappings = load_kernel_mappings(
+        get_project_root() / "scripts" / "tools" / "sglang_comm_kernel_mapping.yaml"
+    )
     use_cache = str(args.use_cache).lower() in {"1", "true", "yes", "on"} and str(args.force_reparse).lower() not in {"1", "true", "yes", "on"}
 
     profile = parse_profile_dir_by_rank(
@@ -1724,9 +1986,14 @@ def main() -> int:
         use_cache=use_cache,
         source_map=source_map,
     )
-    cfg = load_tool_config()
-    model_name = str(((cfg.get("paths") or {}).get("model_name") or infer_model_name(profile) or "unknown"))
-    markdown, tables = build_markdown(profile, args.rank, model_name=model_name, top_kernels_per_op=args.top_kernels_per_op)
+    model_name = str(validated_identity["model_name"])
+    markdown, tables = build_markdown(
+        profile,
+        args.rank,
+        model_name=model_name,
+        top_kernels_per_op=args.top_kernels_per_op,
+        comm_mappings=comm_mappings,
+    )
     md_path = output_dir / "sglang_perf_analysis_torch.md"
     xlsx_path = output_dir / "sglang_perf_analysis_torch.xlsx"
     md_path.write_text(markdown, encoding="utf-8")

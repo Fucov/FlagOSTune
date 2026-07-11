@@ -1,0 +1,378 @@
+- pattern: "all_reduce_one_shot_push_kernel"
+  match_field: "kernel_name"
+  provider: "SGLang CustomAllReduceV2"
+  op_kind: "Communication/SGLang Custom AllReduce"
+  communication_type: "custom_all_reduce"
+  source_files:
+    - "sglang/srt/distributed/parallel_state.py"
+    - "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py"
+    - "sglang/jit_kernel/all_reduce.py"
+    - "sglang/jit_kernel/csrc/distributed/custom_all_reduce_push.cuh"
+  confidence: "high"
+  evidence: "CustomAllReduceV2 selects ONE_SHOT_PUSH and jit_kernel/all_reduce.py loads custom_all_reduce_push.cuh, which defines this kernel."
+  needs_source_check: false
+
+- pattern: "all_reduce_one_shot_pull_kernel"
+  match_field: "kernel_name"
+  provider: "SGLang CustomAllReduceV2"
+  op_kind: "Communication/SGLang Custom AllReduce"
+  communication_type: "custom_all_reduce"
+  source_files:
+    - "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py"
+    - "sglang/jit_kernel/all_reduce.py"
+    - "sglang/jit_kernel/csrc/distributed/custom_all_reduce_pull.cuh"
+  confidence: "medium"
+  evidence: "Semantic/version-compatibility pattern for V2 ONE_SHOT_PULL. The audited commit names the actual JIT symbol all_reduce_one_shot_kernel, so verify the installed server source when this exact name appears."
+  needs_source_check: true
+
+- pattern: "two_shot_pull"
+  match_field: "kernel_name"
+  provider: "SGLang CustomAllReduceV2"
+  op_kind: "Communication/SGLang Custom AllReduce"
+  communication_type: "custom_all_reduce"
+  source_files:
+    - "sglang/srt/distributed/device_communicators/custom_all_reduce_v2.py"
+    - "sglang/jit_kernel/all_reduce.py"
+    - "sglang/jit_kernel/csrc/distributed/custom_all_reduce_pull.cuh"
+  confidence: "medium"
+  evidence: "Semantic/version-compatibility pattern for V2 TWO_SHOT_PULL. The audited commit names the actual JIT symbol all_reduce_two_shot_kernel and AllReduceAlgo.shot returns 2."
+  needs_source_check: true
+
+- pattern: "_C_custom_ar|cross_device_reduce"
+  match_field: "event_or_kernel_name"
+  provider: "SGLang CustomAllreduceV1"
+  op_kind: "Communication/SGLang Custom AllReduce"
+  communication_type: "custom_all_reduce"
+  source_files:
+    - "sglang/srt/distributed/device_communicators/custom_all_reduce.py"
+    - "sglang/srt/distributed/device_communicators/custom_all_reduce_ops.py"
+  confidence: "high"
+  evidence: "Legacy custom-all-reduce extension/operator and kernel path; not an NCCL device kernel."
+  needs_source_check: false
+
+- pattern: "sglang::outplace_all_reduce"
+  match_field: "operator_name"
+  provider: "SGLang GroupCoordinator"
+  op_kind: "Communication/Dispatch Wrapper"
+  communication_type: "backend_dependent_all_reduce"
+  source_files:
+    - "sglang/srt/distributed/communication_op.py"
+    - "sglang/srt/distributed/parallel_state.py"
+  confidence: "high"
+  evidence: "Registered custom op dispatches by method ca/qr/pymscclpp/torch_symm_mem/pynccl; child kernel is required to identify the backend."
+  needs_source_check: false
+
+- pattern: "ncclDevKernel_AllGather"
+  match_field: "kernel_name"
+  provider: "NCCL"
+  op_kind: "Communication/NCCL AllGather"
+  communication_type: "nccl"
+  source_files:
+    - "sglang/srt/distributed/device_communicators/pynccl.py"
+    - "sglang/srt/distributed/device_communicators/pynccl_wrapper.py"
+  confidence: "high"
+  evidence: "NCCL device-kernel name; PyNcclCommunicator.all_gather calls NCCLLibrary.ncclAllGather."
+  needs_source_check: false
+
+- pattern: "ncclDevKernel_AllReduce"
+  match_field: "kernel_name"
+  provider: "NCCL"
+  op_kind: "Communication/NCCL AllReduce"
+  communication_type: "nccl"
+  source_files:
+    - "sglang/srt/distributed/device_communicators/pynccl.py"
+    - "sglang/srt/distributed/device_communicators/pynccl_wrapper.py"
+  confidence: "high"
+  evidence: "NCCL device-kernel name; PyNcclCommunicator all_reduce paths call NCCLLibrary.ncclAllReduce."
+  needs_source_check: false
+
+- pattern: "gloo:broadcast"
+  match_field: "event_name"
+  provider: "Gloo / torch.distributed"
+  op_kind: "Communication/CPU Control Plane"
+  communication_type: "gloo_cpu"
+  source_files:
+    - "sglang/srt/distributed/parallel_state.py"
+  confidence: "high"
+  evidence: "GroupCoordinator creates a Gloo cpu_group for object, metadata, and rendezvous communication; not GPU kernel time."
+  needs_source_check: false
+
+- pattern: "torch.distributed.broadcast"
+  match_field: "event_name"
+  provider: "PyTorch Distributed"
+  op_kind: "Communication/Backend Dependent Broadcast"
+  communication_type: "torch_distributed"
+  source_files:
+    - "sglang/srt/distributed/parallel_state.py"
+    - "sglang/srt/distributed/device_communicators/custom_all_reduce.py"
+  confidence: "medium"
+  evidence: "Classify as CPU/control-plane only when the enclosing process group is Gloo/CPU; NCCL device-group broadcasts require GPU classification."
+  needs_source_check: true
+
+- pattern: "flashinfernorm"
+  match_field: "kernel_name"
+  provider: "FlashInfer Norm"
+  op_kind: "Compute/Norm Fusion"
+  communication_type: "none"
+  source_files:
+    - "sglang/srt/layers/layernorm.py"
+  confidence: "high"
+  evidence: "FlashInfer norm kernel naming proves norm computation, not flashinfer.comm allreduce fusion."
+  needs_source_check: false
+
+- pattern: "fused_add_rmsnorm"
+  match_field: "kernel_name"
+  provider: "FlashInfer Norm"
+  op_kind: "Compute/Residual Add + RMSNorm Fusion"
+  communication_type: "none"
+  source_files:
+    - "sglang/srt/layers/layernorm.py"
+  confidence: "high"
+  evidence: "Fused norm computation; no collective is implied by this name."
+  needs_source_check: false
+
+- pattern: "RMSNormKernel"
+  match_field: "kernel_name"
+  provider: "FlashInfer or Norm Backend"
+  op_kind: "Compute/RMSNorm"
+  communication_type: "none"
+  source_files:
+    - "sglang/srt/layers/layernorm.py"
+  confidence: "high"
+  evidence: "RMSNorm compute kernel; use an enclosing allreduce-fusion event to claim communication fusion."
+  needs_source_check: false
+
+- pattern: "flashinfer_comm_fusion"
+  match_field: "event_name"
+  provider: "FlashInfer Communication Fusion"
+  op_kind: "Communication+Compute/AllReduce Residual RMSNorm Fusion"
+  communication_type: "flashinfer_allreduce_fusion"
+  source_files:
+    - "sglang/srt/layers/flashinfer_comm_fusion.py"
+    - "sglang/srt/layers/communicator.py"
+  confidence: "medium"
+  evidence: "Module/path marker for the fusion implementation; confirm the exact allreduce_fusion call or fused custom op."
+  needs_source_check: true
+
+- pattern: "flashinfer.comm"
+  match_field: "event_name"
+  provider: "FlashInfer Communication Fusion"
+  op_kind: "Communication+Compute/FlashInfer Collective"
+  communication_type: "flashinfer_allreduce_fusion"
+  source_files:
+    - "sglang/srt/layers/flashinfer_comm_fusion.py"
+  confidence: "medium"
+  evidence: "FlashInfer communication namespace; confirm allreduce_fusion and trtllm/mnnvl backend rather than another comm API."
+  needs_source_check: true
+
+- pattern: "deep_gemm::sm90_fp8_gemm"
+  match_field: "kernel_name"
+  provider: "DeepGEMM"
+  op_kind: "Compute/FP8 GEMM"
+  communication_type: "none"
+  source_files:
+    - "sglang/srt/layers/deep_gemm_wrapper/entrypoint.py"
+    - "sglang/srt/layers/quantization/fp8_kernel.py"
+  confidence: "high"
+  evidence: "Third-party DeepGEMM SM90 matrix multiplication kernel; no collective in the call path."
+  needs_source_check: false
+
+- pattern: "sglang::deep_gemm_fp8_fp8_bf16_nt"
+  match_field: "operator_name"
+  provider: "SGLang DeepGEMM Wrapper"
+  op_kind: "Compute/FP8 GEMM"
+  communication_type: "none"
+  source_files:
+    - "sglang/srt/layers/quantization/fp8_kernel.py"
+    - "sglang/srt/layers/deep_gemm_wrapper/entrypoint.py"
+    - "sglang/srt/layers/quantization/fp8_utils.py"
+  confidence: "high"
+  evidence: "Registered custom op calls gemm_nt_f8f8bf16 then deep_gemm.fp8_gemm_nt."
+  needs_source_check: false
+
+- pattern: "fused_moe_kernel"
+  match_field: "kernel_name"
+  provider: "SGLang Triton Fused MoE"
+  op_kind: "Compute/MoE Expert"
+  communication_type: "none"
+  source_files:
+    - "sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py"
+    - "sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe_triton_kernels.py"
+  confidence: "high"
+  evidence: "Local fused expert GEMM/activation kernel; EP communication requires separate dispatcher evidence."
+  needs_source_check: false
+
+- pattern: "topkGatingSoftmax"
+  match_field: "kernel_name"
+  provider: "SGLang MoE TopK"
+  op_kind: "Compute/MoE Routing"
+  communication_type: "none"
+  source_files:
+    - "sglang/srt/layers/moe/topk.py"
+  confidence: "high"
+  evidence: "Gate softmax and top-k expert selection, not a collective."
+  needs_source_check: false
+
+- pattern: "moe_align_block_size"
+  match_field: "kernel_name"
+  provider: "SGLang MoE"
+  op_kind: "Compute/MoE Token Alignment"
+  communication_type: "none"
+  source_files:
+    - "sglang/srt/layers/moe/moe_runner/triton_utils/moe_align_block_size.py"
+  confidence: "high"
+  evidence: "Counts, sorts, and pads tokens by expert for blocked local GEMM."
+  needs_source_check: false
+
+- pattern: "moe_sum_reduce"
+  match_field: "kernel_name"
+  provider: "SGLang MoE"
+  op_kind: "Compute/MoE Local Expert Output Reduce"
+  communication_type: "none"
+  source_files:
+    - "sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py"
+  confidence: "high"
+  evidence: "Local top-k expert output reduction; reduce in the name is not cross-rank all-reduce."
+  needs_source_check: false
+
+- pattern: "all_to_all"
+  match_field: "event_or_kernel_name"
+  provider: "MoE EP Backend / torch.distributed"
+  op_kind: "Communication/MoE Expert Parallel AllToAll"
+  communication_type: "all_to_all"
+  source_files:
+    - "sglang/srt/distributed/parallel_state.py"
+    - "sglang/srt/layers/moe/token_dispatcher/standard.py"
+  confidence: "medium"
+  evidence: "Typical EP token exchange; identify NCCL, FlashInfer, or other provider from the enclosing dispatcher/kernel."
+  needs_source_check: true
+
+- pattern: "reduce_scatter"
+  match_field: "event_or_kernel_name"
+  provider: "SGLang/PyNccl/torch.distributed"
+  op_kind: "Communication/ReduceScatter"
+  communication_type: "reduce_scatter"
+  source_files:
+    - "sglang/srt/distributed/parallel_state.py"
+    - "sglang/srt/layers/communicator.py"
+  confidence: "medium"
+  evidence: "Collective semantic marker; child kernel/process group is needed to determine provider."
+  needs_source_check: true
+
+- pattern: "dispatch"
+  match_field: "event_or_kernel_name"
+  provider: "MoE Token Dispatcher"
+  op_kind: "Communication or Compute/MoE Dispatch"
+  communication_type: "moe_dispatch_unknown"
+  source_files:
+    - "sglang/srt/layers/moe/token_dispatcher/base.py"
+    - "sglang/srt/layers/moe/token_dispatcher/deepep.py"
+  confidence: "low"
+  evidence: "Dispatch may be local permutation or EP transfer; require enclosing backend and EP configuration."
+  needs_source_check: true
+
+- pattern: "combine"
+  match_field: "event_or_kernel_name"
+  provider: "MoE Token Dispatcher"
+  op_kind: "Communication or Compute/MoE Combine"
+  communication_type: "moe_combine_unknown"
+  source_files:
+    - "sglang/srt/layers/moe/token_dispatcher/base.py"
+    - "sglang/srt/layers/moe/token_dispatcher/deepep.py"
+  confidence: "low"
+  evidence: "Combine may include return EP transfer or only local merge; backend correlation is required."
+  needs_source_check: true
+
+- pattern: "deepep"
+  match_field: "event_or_kernel_name"
+  provider: "DeepEP"
+  op_kind: "Communication/MoE Expert Parallel"
+  communication_type: "deepep"
+  source_files:
+    - "sglang/srt/layers/moe/token_dispatcher/deepep.py"
+    - "sglang/srt/layers/moe/fused_moe_triton/layer.py"
+  confidence: "medium"
+  evidence: "DeepEP marker; confirm normal/low-latency dispatch or combine operation."
+  needs_source_check: true
+
+- pattern: "_fwd_grouped_kernel_stage1"
+  match_field: "kernel_name"
+  provider: "SGLang Triton Attention"
+  op_kind: "Compute/Decode Attention Stage 1"
+  communication_type: "none"
+  source_files:
+    - "sglang/kernels/ops/attention/decode_attention.py"
+  confidence: "high"
+  evidence: "Exact Triton definition and launch are present in decode_attention.py; this is split-KV decode attention compute, not communication."
+  needs_source_check: false
+
+- pattern: "_fwd_kernel_stage2"
+  match_field: "kernel_name"
+  provider: "SGLang Triton Attention"
+  op_kind: "Compute/Decode Attention Stage 2"
+  communication_type: "none"
+  source_files:
+    - "sglang/kernels/ops/attention/decode_attention.py"
+  confidence: "high"
+  evidence: "Exact Triton definition in decode_attention.py reduces split attention intermediates locally."
+  needs_source_check: false
+
+- pattern: "_fwd_kernel"
+  match_field: "kernel_name"
+  provider: "SGLang Triton Attention"
+  op_kind: "Compute/Prefill or Extend Attention"
+  communication_type: "none"
+  source_files:
+    - "sglang/kernels/ops/attention/prefill_attention.py"
+    - "sglang/kernels/ops/attention/extend_attention.py"
+  confidence: "medium"
+  evidence: "Both SGLang prefill and extend Triton attention define this generic symbol; enclosing launch stack is needed to distinguish them."
+  needs_source_check: true
+
+- pattern: "per_token_group_quant_8bit_v2"
+  match_field: "kernel_name"
+  provider: "SGLang JIT Quantization"
+  op_kind: "Compute/FP8 Quantization"
+  communication_type: "none"
+  source_files:
+    - "sglang/jit_kernel/per_token_group_quant_8bit_v2.py"
+    - "sglang/jit_kernel/csrc/gemm/per_token_group_quant_8bit_v2.cuh"
+    - "sglang/srt/layers/quantization/fp8_kernel.py"
+    - "sglang/srt/layers/quantization/fp8_utils.py"
+  confidence: "high"
+  evidence: "Exact JIT custom op and CUDA kernel prepare per-token grouped FP8 values and scales."
+  needs_source_check: false
+
+- pattern: "fused_recurrent_gated_delta_rule"
+  match_field: "kernel_name"
+  provider: "SGLang FLA Recurrent Attention"
+  op_kind: "Compute/Recurrent Attention"
+  communication_type: "none"
+  source_files:
+    - "sglang/srt/layers/attention/fla/fused_recurrent.py"
+  confidence: "high"
+  evidence: "Exact local recurrent gated-delta implementation; no collective in the kernel path."
+  needs_source_check: false
+
+- pattern: "causal_conv1d"
+  match_field: "kernel_name"
+  provider: "SGLang Mamba / causal-conv1d backend"
+  op_kind: "Compute/Convolution"
+  communication_type: "none"
+  source_files:
+    - "sglang/srt/layers/attention/mamba/causal_conv1d.py"
+    - "sglang/kernels/ops/mamba/__init__.py"
+  confidence: "high"
+  evidence: "Local causal convolution wrappers/kernels used by hybrid or recurrent layers; not communication."
+  needs_source_check: false
+
+- pattern: "store_kvcache"
+  match_field: "kernel_name"
+  provider: "SGLang Attention Backend"
+  op_kind: "Compute/Memory KV Cache Store"
+  communication_type: "none"
+  source_files:
+    - "sglang/jit_kernel/csrc/elementwise/kvcache.cuh"
+  confidence: "high"
+  evidence: "Writes key/value tensors to the local KV cache; no cross-rank collective is implied."
+  needs_source_check: false
