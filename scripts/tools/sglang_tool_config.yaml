@@ -1,35 +1,132 @@
 current_run:
-  device: 4,5,6,7
+  device: 0,1,2,3,4,5,6,7
   scenario_type: optimized
   torch_profile: true
+  torch_profiler_light: true
+  torch_with_stack: false
+  torch_record_shapes: false
+  torch_profile_memory: false
+  torch_with_modules: false
 model:
-  path: /data/models/Qwen3.6-35B-A3B-FP8
-  name: Qwen3.6-35B-A3B-FP8-TP4-P32768D1024C1
-  tokenizer_path: /data/models/Qwen3.6-35B-A3B-FP8
-  tensor_parallel_size: 4
-serve: {}
-sglang:
-  context_length: 65536
-  mem_fraction_static: 0.80
-  load_format: auto
+  path: /data/models/DeepSeek-V4-Flash-FP8
+  name: DeepSeek-V4-Flash-FP8-TP8-P2048D128
+  tokenizer_path: ""
+  tensor_parallel_size: 8
+serve:
+  gpu_memory_utilization: 0.85
+  max_num_batched_tokens: 16384
+  max_num_seqs: 2048
   trust_remote_code: true
-  extra_args: --disable-cuda-graph --attention-backend triton --sampling-backend pytorch --watchdog-timeout 3600 --max-running-requests 2048 --chunked-prefill-size 16384 --max-prefill-tokens 16384 --port 30001 --nccl-port 29501
+  tokenizer_mode: deepseek_v4
+  tool_call_parser: deepseek_v4
+  reasoning_parser: deepseek_v4
+  load_format: auto
+  extra_args: --kv_cache_dtype fp8 --max-model-len 65536 --no-enable-prefix-caching
+sglang:
+  dtype: bfloat16
+  mem_fraction_static: 0.75
+  context_length: 8192
+  load_format: auto
+  extra_args: --skip-server-warmup --skip-warmup --max-total-tokens 16384 --max-running-requests 1 --chunked-prefill-size 2048 --max-prefill-tokens 2048 --disable-cuda-graph --disable-radix-cache --disable-chunked-prefix-cache --disable-overlap-schedule --random-range-ratio 1.0 --sampling-backend pytorch --watchdog-timeout 1200
 benchmark:
-  dataset_name: sharegpt
-  dataset_path: /data/yangkw/datasets/qwen_controlled/p32768d1024_c1.json
+  dataset_name: random
+  dataset_path: /data/yangkw/datasets/sharegpt_synthetic_2048.json
+  host: 127.0.0.1
+  port_base: 2345
   num_runs: 2
   scenarios:
     optimized:
-      - name: p32768d1024_c1
+      - name: p2048d128
+        input_len: 2048
+        output_len: 128
+        concurrency: 1
+    full:
+      - name: p128d128
+        input_len: 128
+        output_len: 128
+        concurrency: 100
+      - name: p512d512
+        input_len: 512
+        output_len: 512
+        concurrency: 100
+      - name: p1024d1024
+        input_len: 1024
+        output_len: 1024
+        concurrency: 100
+      - name: p2048d1024
+        input_len: 2048
+        output_len: 1024
+        concurrency: 100
+      - name: p4096d1024
+        input_len: 4096
+        output_len: 1024
+        concurrency: 64
+      - name: p6144d1024
+        input_len: 6144
+        output_len: 1024
+        concurrency: 64
+      - name: p32768d1024
         input_len: 32768
         output_len: 1024
+        concurrency: 8
+      - name: p2048d2048
+        input_len: 2048
+        output_len: 2048
+        concurrency: 100
+      - name: p4096d2048
+        input_len: 4096
+        output_len: 2048
+        concurrency: 64
+      - name: p32768d2048
+        input_len: 32768
+        output_len: 2048
+        concurrency: 4
+      - name: p4096d4096
+        input_len: 4096
+        output_len: 4096
+        concurrency: 64
+      - name: p6144d4096
+        input_len: 6144
+        output_len: 4096
+        concurrency: 64
+      - name: p32768d4096
+        input_len: 32768
+        output_len: 4096
+        concurrency: 4
+      - name: p6144d6144
+        input_len: 6144
+        output_len: 6144
+        concurrency: 64
+      - name: p32768d6144
+        input_len: 32768
+        output_len: 6144
+        concurrency: 4
+      - name: p65536d1024
+        input_len: 65536
+        output_len: 6144
+        concurrency: 4
+    shape:
+      - name: p1024d1024
+        input_len: 1024
+        output_len: 1024
+        concurrency: 100
+      - name: p4096d1024
+        input_len: 4096
+        output_len: 1024
+        concurrency: 64
+      - name: p32768d1024
+        input_len: 32768
+        output_len: 1024
+        concurrency: 2
+      - name: p65536d1024
+        input_len: 65536
+        output_len: 6144
         concurrency: 1
-  host: 127.0.0.1
 paths:
   results: results
   reports: reports
   use_model_name: true
-  log_dir: results/Qwen3.6-35B-A3B-FP8-TP4-P32768D1024C1/sglang-bench_optimized_torch_profile_log/sglang_bench_logs
+  log_dir: /data/yangkw/outputs/flagostune_results/DeepSeek-V4-Flash-FP8-TP8-P2048D128/sglang-bench_optimized_torch_profile_log/sglang_bench_logs
   torch_output_dir: results/Qwen3.6-35B-A3B-FP8-TP4-P32768D1024C1/sglang-torch-raw
   reports_dir: reports/Qwen3.6-35B-A3B-FP8-TP4-P32768D1024C1
   model_name: Qwen3.6-35B-A3B-FP8-TP4-P32768D1024C1

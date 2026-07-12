@@ -44,3 +44,5 @@ share/python-wheels/
 *.egg
 MANIFEST
 docs
+sync_remote.sh
+.sync_backup/

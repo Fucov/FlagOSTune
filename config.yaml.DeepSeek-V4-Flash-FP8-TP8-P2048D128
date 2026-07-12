@@ -1,0 +1,134 @@
+model:
+  path: /data/models/DeepSeek-V4-Flash-FP8
+  name: DeepSeek-V4-Flash-FP8-TP8-P2048D128
+  tensor_parallel_size: 8
+  tokenizer_path: null
+serve:
+  gpu_memory_utilization: 0.85
+  max_num_batched_tokens: 16384
+  max_num_seqs: 2048
+  trust_remote_code: true
+  tokenizer_mode: deepseek_v4
+  tool_call_parser: deepseek_v4
+  reasoning_parser: deepseek_v4
+  load_format: auto
+  extra_args: --kv_cache_dtype fp8 --max-model-len 65536 --no-enable-prefix-caching
+sglang:
+  dtype: bfloat16
+  mem_fraction_static: 0.75
+  context_length: 8192
+  load_format: auto
+  extra_args: --skip-server-warmup --skip-warmup --max-total-tokens 16384 --max-running-requests
+    1 --chunked-prefill-size 2048 --max-prefill-tokens 2048 --disable-cuda-graph --disable-radix-cache
+    --disable-chunked-prefix-cache --disable-overlap-schedule --random-range-ratio
+    1.0 --sampling-backend pytorch --watchdog-timeout 1200
+benchmark:
+  dataset_name: random
+  dataset_path: /data/yangkw/datasets/sharegpt_synthetic_2048.json
+  host: 127.0.0.1
+  port_base: 2345
+  num_runs: 2
+  scenarios:
+    optimized:
+    - name: p2048d128
+      input_len: 2048
+      output_len: 128
+      concurrency: 1
+    full:
+    - name: p128d128
+      input_len: 128
+      output_len: 128
+      concurrency: 100
+    - name: p512d512
+      input_len: 512
+      output_len: 512
+      concurrency: 100
+    - name: p1024d1024
+      input_len: 1024
+      output_len: 1024
+      concurrency: 100
+    - name: p2048d1024
+      input_len: 2048
+      output_len: 1024
+      concurrency: 100
+    - name: p4096d1024
+      input_len: 4096
+      output_len: 1024
+      concurrency: 64
+    - name: p6144d1024
+      input_len: 6144
+      output_len: 1024
+      concurrency: 64
+    - name: p32768d1024
+      input_len: 32768
+      output_len: 1024
+      concurrency: 8
+    - name: p2048d2048
+      input_len: 2048
+      output_len: 2048
+      concurrency: 100
+    - name: p4096d2048
+      input_len: 4096
+      output_len: 2048
+      concurrency: 64
+    - name: p32768d2048
+      input_len: 32768
+      output_len: 2048
+      concurrency: 4
+    - name: p4096d4096
+      input_len: 4096
+      output_len: 4096
+      concurrency: 64
+    - name: p6144d4096
+      input_len: 6144
+      output_len: 4096
+      concurrency: 64
+    - name: p32768d4096
+      input_len: 32768
+      output_len: 4096
+      concurrency: 4
+    - name: p6144d6144
+      input_len: 6144
+      output_len: 6144
+      concurrency: 64
+    - name: p32768d6144
+      input_len: 32768
+      output_len: 6144
+      concurrency: 4
+    - name: p65536d1024
+      input_len: 65536
+      output_len: 6144
+      concurrency: 4
+    shape:
+    - name: p1024d1024
+      input_len: 1024
+      output_len: 1024
+      concurrency: 100
+    - name: p4096d1024
+      input_len: 4096
+      output_len: 1024
+      concurrency: 64
+    - name: p32768d1024
+      input_len: 32768
+      output_len: 1024
+      concurrency: 2
+    - name: p65536d1024
+      input_len: 65536
+      output_len: 6144
+      concurrency: 1
+target_ops:
+- reciprocal
+- cat
+- gather
+- lt
+- le
+- softmax
+- scatter
+- cumsum_out
+- layer_norm
+paths:
+  results: /data/yangkw/outputs/flagostune_results
+  reports: /data/yangkw/outputs/flagostune_reports
+  gems_config: gems-config
+  processing: processing
+  use_model_name: true
