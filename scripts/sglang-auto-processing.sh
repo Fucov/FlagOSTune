@@ -32,6 +32,7 @@ FORCE_REPARSE=""
 TOP_K=""
 TOP_KERNELS_PER_OP=""
 SOURCE_MAP=""
+PCT_MODE="mentor"
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -84,6 +85,10 @@ parse_args() {
                 SOURCE_MAP="$2"
                 shift 2
                 ;;
+            --pct-mode)
+                PCT_MODE="$2"
+                shift 2
+                ;;
             -h|--help)
                 head -8 "$0" | tail -5
                 exit 0
@@ -109,12 +114,17 @@ validate_args() {
         log_error "--rank 仅支持数字或 all，当前值: $RANK"
         exit 1
     fi
+    if [[ "$PCT_MODE" != "mentor" ]]; then
+        log_error "--pct-mode 当前仅支持 mentor，当前值: $PCT_MODE"
+        exit 1
+    fi
 }
 
 main() {
     parse_args "$@"
     validate_args
     local args=("--model" "$MODEL_CONFIG" "--workflow" "$WORKFLOW" "--rank" "$RANK")
+    args+=("--pct-mode" "$PCT_MODE")
     if [[ -n "$WORKERS" ]]; then
         args+=("--workers" "$WORKERS")
     fi

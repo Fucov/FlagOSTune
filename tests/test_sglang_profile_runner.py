@@ -162,6 +162,15 @@ class SGLangProfileRunnerTest(unittest.TestCase):
         self.assertIn("--profile-detail", run)
         self.assertIn(".current_run.profile_detail", run)
 
+    def test_processing_scripts_accept_and_forward_pct_mode(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        auto = (root / "scripts" / "sglang-auto-processing.sh").read_text(encoding="utf-8")
+        run = (root / "scripts" / "sglang-run-processing.sh").read_text(encoding="utf-8")
+        self.assertIn("--pct-mode", auto)
+        self.assertIn('args+=("--pct-mode" "$PCT_MODE")', auto)
+        self.assertIn("--pct-mode", run)
+        self.assertIn('args+=("--pct-mode" "$PCT_MODE")', run)
+
     def test_profiler_options_can_enable_full_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = sample_config(Path(tmp))
