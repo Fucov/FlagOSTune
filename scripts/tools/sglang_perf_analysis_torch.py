@@ -531,8 +531,10 @@ def get_correlation_key(event: Dict[str, Any]) -> str:
     return ""
 
 
-def gpu_event_fingerprint(event: Dict[str, Any], rank: int) -> Tuple[str, ...]:
+def gpu_event_fingerprint(event: Dict[str, Any], rank: int) -> Optional[Tuple[str, ...]]:
     """Return a conservative identity for exact duplicate GPU trace events."""
+    if event.get("ts") is None:
+        return None
     args = event_args(event)
 
     def value(*names: str) -> str:
@@ -915,7 +917,7 @@ def parse_trace_file(
                 rank_stats.raw_comm_kernel_events += 1
                 rank_stats.raw_comm_kernel_us += float(dur)
             fingerprint = gpu_event_fingerprint(event, rank)
-            if fingerprint in seen_gpu_events:
+            if fingerprint is not None and fingerprint in seen_gpu_events:
                 rank_stats.duplicate_gpu_kernel_events_filtered += 1
                 rank_stats.duplicate_gpu_kernel_us_filtered += float(dur)
                 if is_raw_comm:
@@ -923,7 +925,8 @@ def parse_trace_file(
                     rank_stats.duplicate_comm_event_filtered_us += float(dur)
                 update_progress(rank_stats, progress_every, started_at)
                 continue
-            seen_gpu_events.add(fingerprint)
+            if fingerprint is not None:
+                seen_gpu_events.add(fingerprint)
             direct_source = extract_source_from_args(args)
             correlated_source = source_by_external_id.get(mapped_external_key, "")
             source_file = direct_source or correlated_source
@@ -1741,7 +1744,8 @@ def build_credibility_rows(profile: ProfileStats) -> List[List[str]]:
     total_calls = sum(agg.calls for _, agg in kernel_aggs)
     unknown_calls = sum(agg.calls for (_kind, op_name, _kernel, _source), agg in kernel_aggs if op_name.startswith("unresolved::"))
     unmapped_calls = unknown_calls
-    missing_source_calls = sum(agg.calls for _, agg in kernel_aggs if agg.source_type == "unknown")
+    missing_source_calls = sum(agg.calls for _, agg in kernel_aggs if not agg.source_file)
+    unresolved_source_calls = sum(agg.calls for _, agg in kernel_aggs if agg.source_type == "unknown")
     source_map_calls = sum(agg.calls for _, agg in kernel_aggs if agg.source_type.startswith("source_map_"))
     correlation_source_calls = sum(agg.calls for _, agg in kernel_aggs if agg.source_type == "correlation")
     profiler_source_calls = sum(agg.calls for _, agg in kernel_aggs if agg.source_type == "profiler_stack")
@@ -1767,6 +1771,7 @@ def build_credibility_rows(profile: ProfileStats) -> List[List[str]]:
         ["unmapped_kernel_pct", fmt_pct(unmapped_calls / total_calls if total_calls else 0.0)],
         ["unknown_op_pct", fmt_pct(unknown_calls / total_calls if total_calls else 0.0)],
         ["source_file_missing_pct", fmt_pct(missing_source_calls / total_calls if total_calls else 0.0)],
+        ["source_file_unresolved_pct", fmt_pct(unresolved_source_calls / total_calls if total_calls else 0.0)],
         ["source_file_from_profiler_pct", fmt_pct(profiler_source_calls / total_calls if total_calls else 0.0)],
         ["source_file_from_correlation_pct", fmt_pct(correlation_source_calls / total_calls if total_calls else 0.0)],
         ["source_file_from_kernel_mapping_pct", fmt_pct(kernel_mapping_calls / total_calls if total_calls else 0.0)],
@@ -1961,7 +1966,7 @@ def build_markdown(
     )
 
     credibility_rows = build_credibility_rows(profile)
-    lines.append("# 数据可信度说明")
+    lines.append("## Source 映射可信度")
     lines.append("")
     lines.append(md_table(["字段", "值"], credibility_rows))
     lines.append("")

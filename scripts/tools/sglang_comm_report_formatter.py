@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -398,7 +398,7 @@ def _candidate_source(row: Dict[str, Any], classification: KernelClassification)
     source_file = str(row.get("source_file") or "")
     if source_file:
         return re.sub(r"\s*\[(?:source_map:[a-z]+|correlation)\]\s*$", "", source_file)
-    return "<br>".join(classification.source_files) or "unknown"
+    return "<br>".join(classification.source_files) or "unresolved/source-check-required"
 
 
 def _explicit_ep_communication(
@@ -432,6 +432,9 @@ def _summaries(
             mappings=mappings,
             has_explicit_ep_communication=has_explicit_ep_communication,
         )
+        explicit_source_type = str(row.get("source_type") or "")
+        if explicit_source_type:
+            classification = replace(classification, source_type=explicit_source_type)
         summaries.append(
             KernelSummary(
                 kind=str(row.get("kind") or "unknown"),
@@ -579,7 +582,7 @@ def build_focus_report_sections(
                 classification.provider,
                 event_name,
                 event_name,
-                source_file or "unknown",
+                source_file or "unresolved/source-check-required",
                 classification.source_type,
                 calls,
                 _fmt_ms(total_us),

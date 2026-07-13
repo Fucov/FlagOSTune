@@ -319,7 +319,7 @@ class SGLangPerfAnalysisTorchTest(unittest.TestCase):
     def test_report_separates_explicit_and_possible_communication(self) -> None:
         formatter = self._comm_formatter()
         rows = [
-            {"kind": "distributed_all_reduce", "op_name": "sglang::outplace_all_reduce", "kernel_name": "all_reduce_one_shot_push_kernel", "source_file": "sglang/srt/distributed/parallel_state.py", "calls": 2, "total_us": 100.0},
+            {"kind": "distributed_all_reduce", "op_name": "sglang::outplace_all_reduce", "kernel_name": "all_reduce_one_shot_push_kernel", "source_file": "sglang/srt/distributed/parallel_state.py", "source_type": "kernel_name_mapping", "calls": 2, "total_us": 100.0},
             {"kind": "distributed_all_gather", "op_name": "record_param_comms", "kernel_name": "ncclDevKernel_AllGather_RING_LL", "source_file": "sglang/srt/distributed/device_communicators/pynccl.py", "calls": 1, "total_us": 20.0},
             {"kind": "moe", "op_name": "sglang::outplace_fused_experts", "kernel_name": "fused_moe_kernel", "source_file": "sglang/srt/layers/moe/", "calls": 4, "total_us": 80.0},
         ]
@@ -335,6 +335,7 @@ class SGLangPerfAnalysisTorchTest(unittest.TestCase):
         self.assertIn("NCCL AllGather", explicit)
         self.assertIn("Control Plane Broadcast", explicit)
         self.assertNotIn("fused_moe_kernel", explicit)
+        self.assertIn("kernel_name_mapping", explicit)
         self.assertIn("当前未在 Top GPU Kernel 中观察到明确 all_to_all / reduce_scatter / DeepEP / flashinfer.comm allreduce_fusion，因此 MoE/FlashInfer 通信融合不计入明确通信。", markdown)
         self.assertIn("当前未观察到显式 all_to_all / reduce_scatter / DeepEP，因此 MoE fused_moe/topk/align/sum_reduce 只能归为 MoE compute/routing/local reduce，不能计入明确通信；是否存在 EP 通信融合需要结合配置和源码进一步确认。", markdown)
 
@@ -451,6 +452,22 @@ class SGLangPerfAnalysisTorchTest(unittest.TestCase):
         self.assertEqual(stats.dedup_comm_kernel_events, 2)
         self.assertEqual(stats.duplicate_comm_event_filtered_count, 1)
         self.assertEqual(stats.duplicate_comm_event_filtered_us, 20.0)
+
+    def test_parser_does_not_deduplicate_events_without_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report-sglang"
+            report_dir.mkdir()
+            event = kernel_event("same_kernel", 10.0)
+            event.pop("ts")
+            write_trace(
+                report_dir / "1783585090.0-TP-0.trace.json",
+                [event, json.loads(json.dumps(event))],
+            )
+            profile = parse_profile_dir_by_rank(
+                report_dir, rank_selector="0", progress_every=0, use_cache=False
+            )
+        self.assertEqual(profile.rank_stats[0].gpu_kernel_events, 2)
+        self.assertEqual(profile.total_kernel_us, 20.0)
 
     def test_kernel_mapping_preserves_provenance_priority(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -642,13 +659,13 @@ class SGLangPerfAnalysisTorchTest(unittest.TestCase):
         env_idx = markdown.index("# 环境")
         op_idx = markdown.index("## 算子数据")
         cuda_idx = markdown.index("## Mentor Style CUDA Kernel（按 op_name 聚合）")
-        credibility_idx = markdown.index("# 数据可信度说明")
+        credibility_idx = markdown.index("## Source 映射可信度")
 
         self.assertLess(env_idx, op_idx)
         self.assertLess(op_idx, cuda_idx)
         self.assertLess(cuda_idx, credibility_idx)
 
-        front_cuda_section = markdown.split("## Mentor Style CUDA Kernel（按 op_name 聚合）", 1)[1].split("# 数据可信度说明", 1)[0]
+        front_cuda_section = markdown.split("## Mentor Style CUDA Kernel（按 op_name 聚合）", 1)[1].split("## Source 映射可信度", 1)[0]
         self.assertIn("| source_file | op_name | kernel_name | 调用次数 | 总时间(ms) | 平均时间(us) | pct | pct_denom | overall_pct | source_type | provider | op_kind |", front_cuda_section)
         self.assertIn("flashinfer_attention_kernel", front_cuda_section)
         self.assertNotIn("scheduler.run_batch", front_cuda_section)
@@ -679,11 +696,13 @@ class SGLangPerfAnalysisTorchTest(unittest.TestCase):
             )
             markdown, _ = build_markdown(profile, "0", model_name="TestModel")
 
-        mentor = markdown.split("## Mentor Style CUDA Kernel（按 op_name 聚合）", 1)[1].split("# 数据可信度说明", 1)[0]
+        mentor = markdown.split("## Mentor Style CUDA Kernel（按 op_name 聚合）", 1)[1].split("## Source 映射可信度", 1)[0]
         self.assertRegex(mentor, r"sglang::outplace_all_reduce.*50\.00%.*total_kernel.*50\.00%")
         self.assertRegex(mentor, r"flashinfer::fused_add_rmsnorm.*80\.00%.*kernel_excluding_primary_allreduce.*40\.00%")
         self.assertRegex(mentor, r"record_param_comms.*20\.00%.*kernel_excluding_primary_allreduce.*10\.00%")
         self.assertIn("只有主 all_reduce 使用 total denominator；NCCL record_param_comms 使用 residual denominator。", markdown)
+        self.assertIn("## Source 映射可信度", markdown)
+        self.assertIn("source_file_missing_pct", markdown)
 
     def test_parse_profile_dir_by_rank_reuses_cache_when_trace_metadata_matches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
