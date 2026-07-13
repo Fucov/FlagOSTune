@@ -618,20 +618,49 @@ class SGLangPerfAnalysisTorchTest(unittest.TestCase):
 
         env_idx = markdown.index("# 环境")
         op_idx = markdown.index("## 算子数据")
-        cuda_idx = markdown.index("## CUDA kernel（按总时间排序）")
+        cuda_idx = markdown.index("## Mentor Style CUDA Kernel（按 op_name 聚合）")
         credibility_idx = markdown.index("# 数据可信度说明")
 
         self.assertLess(env_idx, op_idx)
         self.assertLess(op_idx, cuda_idx)
         self.assertLess(cuda_idx, credibility_idx)
 
-        front_cuda_section = markdown.split("## CUDA kernel（按总时间排序）", 1)[1].split("# 数据可信度说明", 1)[0]
-        self.assertIn("| source file | op_name | kernel_name | 调用次数 | 总时间(ms) | 平均时间(us) | 占比 |", front_cuda_section)
+        front_cuda_section = markdown.split("## Mentor Style CUDA Kernel（按 op_name 聚合）", 1)[1].split("# 数据可信度说明", 1)[0]
+        self.assertIn("| source_file | op_name | kernel_name | 调用次数 | 总时间(ms) | 平均时间(us) | pct | pct_denom | overall_pct | source_type | provider | op_kind |", front_cuda_section)
         self.assertIn("flashinfer_attention_kernel", front_cuda_section)
         self.assertNotIn("scheduler.run_batch", front_cuda_section)
-        self.assertNotIn("source_type", front_cuda_section)
-        self.assertNotIn("overall_pct", front_cuda_section)
+        self.assertIn("source_type", front_cuda_section)
+        self.assertIn("overall_pct", front_cuda_section)
         self.assertIn("## True GPU Kernel 明细", markdown)
+
+    def test_mentor_pct_uses_primary_allreduce_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report-sglang"
+            report_dir.mkdir()
+            write_trace(
+                report_dir / "1783585090.0-TP-0.trace.json",
+                [
+                    cpu_op_event("sglang::outplace_all_reduce", 1),
+                    kernel_event("all_reduce_one_shot_push_kernel", 100.0, 1),
+                    cpu_op_event("flashinfer::fused_add_rmsnorm", 2),
+                    kernel_event("RMSNormKernel", 80.0, 2),
+                    cpu_op_event("record_param_comms", 3),
+                    kernel_event("ncclDevKernel_AllGather_RING_LL", 20.0, 3),
+                ],
+            )
+            profile = parse_profile_dir_by_rank(
+                report_dir,
+                rank_selector="0",
+                progress_every=0,
+                use_cache=False,
+            )
+            markdown, _ = build_markdown(profile, "0", model_name="TestModel")
+
+        mentor = markdown.split("## Mentor Style CUDA Kernel（按 op_name 聚合）", 1)[1].split("# 数据可信度说明", 1)[0]
+        self.assertRegex(mentor, r"sglang::outplace_all_reduce.*50\.00%.*total_kernel.*50\.00%")
+        self.assertRegex(mentor, r"flashinfer::fused_add_rmsnorm.*80\.00%.*kernel_excluding_primary_allreduce.*40\.00%")
+        self.assertRegex(mentor, r"record_param_comms.*20\.00%.*kernel_excluding_primary_allreduce.*10\.00%")
+        self.assertIn("只有主 all_reduce 使用 total denominator；NCCL record_param_comms 使用 residual denominator。", markdown)
 
     def test_parse_profile_dir_by_rank_reuses_cache_when_trace_metadata_matches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

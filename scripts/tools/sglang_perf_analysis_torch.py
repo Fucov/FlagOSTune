@@ -598,6 +598,11 @@ def is_comm_text(*parts: str) -> bool:
     )
 
 
+def unresolved_op_name(kernel_name: str) -> str:
+    family = re.sub(r"[^a-zA-Z0-9]+", "_", kernel_name).strip("_").lower()
+    return f"unresolved::{family[:96] or 'gpu_kernel'}"
+
+
 def load_source_map(path: Optional[Path]) -> List[Dict[str, Any]]:
     if path is None or not path.exists():
         return []
@@ -953,6 +958,13 @@ def parse_trace_file(
                 if not source_file and mapped_source:
                     source_file = mapped_source
                     source_type = mapped_source_type
+            if not op_name or op_name == "unknown":
+                op_name = unresolved_op_name(name)
+                needs_source_check = True
+            if not source_file:
+                source_file = "unresolved/source-check-required"
+                source_type = "unknown"
+                needs_source_check = True
             rank_stats.total_kernel_us += float(dur)
             rank_stats.gpu_kernel_events += 1
             if is_raw_comm:
@@ -1629,7 +1641,7 @@ def build_event_conclusions(event_aggs: List[Tuple[Tuple[str, str, str], Aggrega
 def build_unknown_rows(kernel_aggs: List[Tuple[Tuple[str, str, str, str], Aggregate]], limit: int = 50) -> List[List[str]]:
     rows: List[List[str]] = []
     for (kind, op_name, kernel_name, source_file), agg in kernel_aggs:
-        if op_name != "unknown" and kind != OpKind.NON_DISTRIBUTED.value and source_file:
+        if not op_name.startswith("unresolved::") and agg.source_type != "unknown":
             continue
         rows.append([
             md_escape(compact_kernel_name(kernel_name)),
@@ -1637,7 +1649,7 @@ def build_unknown_rows(kernel_aggs: List[Tuple[Tuple[str, str, str, str], Aggreg
             fmt_ms(agg.total_us),
             report_type_for(kind, op_name, kernel_name, source_file),
             md_escape(source_file),
-            "missing cpu_op/source mapping" if op_name == "unknown" or not source_file else "classified as other",
+            "missing precise cpu_op/source mapping; low-confidence fallback shown",
         ])
         if len(rows) >= limit:
             break
@@ -1690,12 +1702,16 @@ def build_type_rows(
         "Other GPU Kernel",
     ]
     type_aggs: Dict[str, Aggregate] = {name: Aggregate() for name in type_order}
+    primary_by_type: Dict[str, float] = defaultdict(float)
     for (kind, op_name, kernel_name, source_file), agg in kernel_aggs:
-        type_aggs[report_type_for(kind, op_name, kernel_name, source_file)].add(agg.total_us, agg.calls)
+        label = report_type_for(kind, op_name, kernel_name, source_file)
+        type_aggs[label].add(agg.total_us, agg.calls)
+        if is_primary_allreduce(op_name, kernel_name, agg.provider):
+            primary_by_type[label] += agg.total_us
     type_rows: List[List[str]] = []
     for label in type_order:
         agg = type_aggs[label]
-        denom = total_ref if label.startswith("Communication/") else non_comm_ref
+        denom = total_ref if agg.total_us > 0 and primary_by_type[label] == agg.total_us else non_comm_ref
         type_rows.append([
             label,
             str(agg.calls),
@@ -1712,21 +1728,37 @@ def build_credibility_rows(profile: ProfileStats) -> List[List[str]]:
     true_gpu_kernel_events = sum(stat.gpu_kernel_events for stat in profile.rank_stats.values())
     profiler_event_events = sum(stat.profiler_events for stat in profile.rank_stats.values())
     duplicate_comm = sum(stat.duplicate_comm_event_filtered_count for stat in profile.rank_stats.values())
+    duplicate_comm_us = sum(stat.duplicate_comm_event_filtered_us for stat in profile.rank_stats.values())
+    raw_gpu_events = sum(stat.raw_gpu_kernel_events for stat in profile.rank_stats.values())
+    raw_gpu_us = sum(stat.raw_gpu_kernel_us for stat in profile.rank_stats.values())
+    duplicate_gpu_events = sum(stat.duplicate_gpu_kernel_events_filtered for stat in profile.rank_stats.values())
+    duplicate_gpu_us = sum(stat.duplicate_gpu_kernel_us_filtered for stat in profile.rank_stats.values())
+    raw_comm_events = sum(stat.raw_comm_kernel_events for stat in profile.rank_stats.values())
+    raw_comm_us = sum(stat.raw_comm_kernel_us for stat in profile.rank_stats.values())
+    dedup_comm_events = sum(stat.dedup_comm_kernel_events for stat in profile.rank_stats.values())
+    dedup_comm_us = sum(stat.dedup_comm_kernel_us for stat in profile.rank_stats.values())
     kernel_aggs = aggregate_kernel_aggs(profile)
     total_calls = sum(agg.calls for _, agg in kernel_aggs)
-    unknown_calls = sum(agg.calls for (kind, op_name, _kernel, _source), agg in kernel_aggs if op_name == "unknown" or kind == OpKind.NON_DISTRIBUTED.value)
-    unmapped_calls = sum(agg.calls for (_kind, op_name, _kernel, _source), agg in kernel_aggs if op_name == "unknown")
-    missing_source_calls = sum(agg.calls for (_kind, _op_name, _kernel, source), agg in kernel_aggs if not source)
-    source_map_calls = sum(agg.calls for (_kind, _op_name, _kernel, source), agg in kernel_aggs if "[source_map:" in source)
-    correlation_source_calls = sum(agg.calls for (_kind, _op_name, _kernel, source), agg in kernel_aggs if "[correlation]" in source)
-    profiler_source_calls = sum(
-        agg.calls
-        for (_kind, _op_name, _kernel, source), agg in kernel_aggs
-        if source and "[source_map:" not in source and "[correlation]" not in source
-    )
+    unknown_calls = sum(agg.calls for (_kind, op_name, _kernel, _source), agg in kernel_aggs if op_name.startswith("unresolved::"))
+    unmapped_calls = unknown_calls
+    missing_source_calls = sum(agg.calls for _, agg in kernel_aggs if agg.source_type == "unknown")
+    source_map_calls = sum(agg.calls for _, agg in kernel_aggs if agg.source_type.startswith("source_map_"))
+    correlation_source_calls = sum(agg.calls for _, agg in kernel_aggs if agg.source_type == "correlation")
+    profiler_source_calls = sum(agg.calls for _, agg in kernel_aggs if agg.source_type == "profiler_stack")
+    kernel_mapping_calls = sum(agg.calls for _, agg in kernel_aggs if agg.source_type == "kernel_name_mapping")
     distributed_total = profile.distributed_total_us
     return [
         ["parsed events", f"{parsed_events:,}"],
+        ["raw_gpu_kernel_events", f"{raw_gpu_events:,}"],
+        ["raw_gpu_kernel_time_ms", fmt_ms(raw_gpu_us)],
+        ["dedup_gpu_kernel_events", f"{true_gpu_kernel_events:,}"],
+        ["dedup_gpu_kernel_time_ms", fmt_ms(profile.total_kernel_us)],
+        ["duplicate_gpu_kernel_events_filtered", f"{duplicate_gpu_events:,}"],
+        ["duplicate_gpu_kernel_time_ms_filtered", fmt_ms(duplicate_gpu_us)],
+        ["raw_comm_kernel_events", f"{raw_comm_events:,}"],
+        ["raw_comm_kernel_time_ms", fmt_ms(raw_comm_us)],
+        ["dedup_comm_kernel_events", f"{dedup_comm_events:,}"],
+        ["dedup_comm_kernel_time_ms", fmt_ms(dedup_comm_us)],
         ["true_gpu_kernel_events", f"{true_gpu_kernel_events:,}"],
         ["profiler_event_events", f"{profiler_event_events:,}"],
         ["total_true_gpu_kernel_time_ms", fmt_ms(profile.total_kernel_us)],
@@ -1737,9 +1769,10 @@ def build_credibility_rows(profile: ProfileStats) -> List[List[str]]:
         ["source_file_missing_pct", fmt_pct(missing_source_calls / total_calls if total_calls else 0.0)],
         ["source_file_from_profiler_pct", fmt_pct(profiler_source_calls / total_calls if total_calls else 0.0)],
         ["source_file_from_correlation_pct", fmt_pct(correlation_source_calls / total_calls if total_calls else 0.0)],
+        ["source_file_from_kernel_mapping_pct", fmt_pct(kernel_mapping_calls / total_calls if total_calls else 0.0)],
         ["source_file_from_source_map_pct", fmt_pct(source_map_calls / total_calls if total_calls else 0.0)],
         ["duplicate_comm_event_filtered_count", f"{duplicate_comm:,}"],
-        ["duplicate_comm_event_filtered_time_ms", "未采集"],
+        ["duplicate_comm_event_filtered_time_ms", fmt_ms(duplicate_comm_us)],
         ["cache_used", "见解析日志"],
         ["parser version", str(CACHE_SCHEMA_VERSION)],
     ]
@@ -1748,52 +1781,80 @@ def build_credibility_rows(profile: ProfileStats) -> List[List[str]]:
 def build_op_kernel_rows(
     kernel_aggs: List[Tuple[Tuple[str, str, str, str], Aggregate]],
     total_ref: float,
-    non_comm_ref: float,
+    residual_ref: float,
     top_kernels_per_op: int,
 ) -> List[List[str]]:
-    groups: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    groups: Dict[str, Dict[str, Any]] = {}
     for (kind, op_name, kernel_name, source_file), agg in kernel_aggs:
-        key = (kind, op_name, source_file)
-        group = groups.setdefault(key, {"calls": 0, "total_us": 0.0, "kernels": defaultdict(float)})
+        group = groups.setdefault(op_name, {
+            "calls": 0,
+            "total_us": 0.0,
+            "kernels": defaultdict(float),
+            "sources": {},
+            "source_types": [],
+            "providers": [],
+            "op_kinds": [],
+            "primary": False,
+        })
         group["calls"] += agg.calls
         group["total_us"] += agg.total_us
         group["kernels"][kernel_name] += agg.total_us
+        group["sources"][source_file] = group["sources"].get(source_file, 0.0) + agg.total_us
+        group["source_types"].append(agg.source_type)
+        group["providers"].append(agg.provider)
+        group["op_kinds"].append(agg.op_kind or report_type_for(kind, op_name, kernel_name, source_file))
+        group["primary"] = group["primary"] or is_primary_allreduce(op_name, kernel_name, agg.provider)
 
     rows: List[List[str]] = []
-    for (kind, op_name, source_file), group in sorted(groups.items(), key=lambda item: item[1]["total_us"], reverse=True)[:200]:
+    eligible = [item for item in groups.items() if float(item[1]["total_us"]) > 1.0]
+    for op_name, group in sorted(eligible, key=lambda item: item[1]["total_us"], reverse=True)[:80]:
         total_us = float(group["total_us"])
         calls = int(group["calls"])
         kernels = sorted(group["kernels"].items(), key=lambda item: item[1], reverse=True)[:top_kernels_per_op]
         kernel_text = "<br>".join(md_escape(compact_kernel_name(name)) for name, _ in kernels)
-        denom = total_ref if kind.startswith(DISTRIBUTED_PREFIX) else non_comm_ref
+        primary = bool(group["primary"])
+        denom = total_ref if primary else residual_ref
+        pct_denom = "total_kernel" if primary else "kernel_excluding_primary_allreduce"
+        sources = sorted(group["sources"].items(), key=lambda item: item[1], reverse=True)
+        source_text = "<br>".join(md_escape(source) for source, _ in sources)
+        source_types = "<br>".join(dict.fromkeys(group["source_types"]))
+        providers = "<br>".join(dict.fromkeys(group["providers"]))
+        op_kinds = "<br>".join(dict.fromkeys(group["op_kinds"]))
         rows.append([
-            md_escape(source_file),
-            source_type_for(source_file),
+            source_text,
             md_escape(op_name),
-            report_type_for(kind, op_name, "", source_file),
             kernel_text,
             str(calls),
             fmt_ms(total_us),
             fmt_us(total_us / calls if calls else 0.0),
             fmt_pct(total_us / denom if denom > 0 else 0.0),
+            pct_denom,
             fmt_pct(total_us / total_ref if total_ref > 0 else 0.0),
+            source_types,
+            providers,
+            op_kinds,
         ])
     return rows
 
 
 def build_mentor_cuda_rows(detail_rows: List[List[str]]) -> List[List[str]]:
-    rows: List[List[str]] = []
-    for row in detail_rows:
-        rows.append([
-            row[0],
-            row[2],
-            row[4],
-            row[5],
-            row[6],
-            row[7],
-            row[8],
-        ])
-    return rows
+    return detail_rows
+
+
+def is_primary_allreduce(op_name: str, kernel_name: str, provider: str = "") -> bool:
+    op = op_name.lower()
+    kernel = kernel_name.lower()
+    provider_text = provider.lower()
+    return (
+        op in {"sglang::outplace_all_reduce", "_c_custom_ar::all_reduce", "vllm::all_reduce"}
+        or any(token in kernel for token in (
+            "all_reduce_one_shot_push_kernel",
+            "all_reduce_one_shot_pull_kernel",
+            "two_shot_pull",
+            "cross_device_reduce",
+        ))
+        or provider_text in {"sglang customallreducev2", "sglang customallreducev1"}
+    ) and op != "record_param_comms" and "nccldevkernel" not in kernel
 
 
 def source_type_for(source_file: str) -> str:
@@ -1814,18 +1875,24 @@ def build_markdown(
     model_name: str = "",
     top_kernels_per_op: int = 8,
     comm_mappings: Optional[Sequence[Dict[str, Any]]] = None,
+    pct_mode: str = "mentor",
 ) -> Tuple[str, List[Dict[str, Any]]]:
     model_name = model_name or infer_model_name(profile) or "unknown"
     lines: List[str] = [mentor_title(model_name), ""]
     tables: List[Dict[str, Any]] = []
     distributed_total = profile.distributed_total_us
     total_ref = profile.total_kernel_us or profile.profiler_txt_total_us
-    non_comm_ref = max(profile.total_kernel_us - distributed_total, 0.0) or profile.total_kernel_us
     parsed_events = sum(stat.parsed_events for stat in profile.rank_stats.values())
     gpu_events = sum(stat.gpu_kernel_events for stat in profile.rank_stats.values())
     all_kernel_aggs = aggregate_kernel_aggs(profile)
+    primary_allreduce_us = sum(
+        agg.total_us
+        for (_kind, op_name, kernel_name, _source), agg in all_kernel_aggs
+        if is_primary_allreduce(op_name, kernel_name, agg.provider)
+    )
+    residual_ref = max(total_ref - primary_allreduce_us, 0.0)
     event_aggs = aggregate_event_hotspots(profile)
-    type_rows = build_type_rows(all_kernel_aggs, total_ref, non_comm_ref)
+    type_rows = build_type_rows(all_kernel_aggs, total_ref, residual_ref)
 
     env_rows = build_environment_rows(profile, rank_selector, model_name)
     lines.extend(build_mentor_environment_section(env_rows))
@@ -1833,17 +1900,23 @@ def build_markdown(
 
     lines.append("## 算子数据")
     lines.append("")
-    lines.append("1. 占比说明：Communication / NCCL / all_reduce 使用全部 GPU kernel 总时间作为分母；其它算子默认使用排除通信后的 GPU kernel 总时间作为分母；同时保留 overall_pct。")
-    lines.append("2. Torch profiler duration 是事件耗时累计，不完全等同 wall-clock latency。")
-    lines.append(f"3. 基于 torch profiler rank {rank_selector} trace 文件生成。")
-    lines.append(f"4. parsed events: {parsed_events:,}；true gpu kernel events: {gpu_events:,}。")
-    lines.append("5. 本报告 True GPU Kernel 只统计真实 CUDA/NCCL/Triton kernel；fast_trace_kernel_summary.py 的 gpu_events 是 kernel-like 快速过滤口径，会包含更多 CUDA/runtime/Triton/高层相似事件，二者不可直接对齐。")
+    lines.append("占比说明：")
+    lines.append("1. 主 all_reduce 使用全部 True GPU Kernel 总时间作为分母。")
+    lines.append("2. 其它算子使用排除主 all_reduce 后的剩余 True GPU Kernel 时间作为分母。")
+    lines.append("3. overall_pct 始终使用全部 True GPU Kernel 总时间作为分母。")
+    lines.append("4. 因此各行 pct 不可相加为 100%，该口径用于对齐 mentor 报告。")
+    lines.append("5. 只有主 all_reduce 使用 total denominator；NCCL record_param_comms 使用 residual denominator。")
+    lines.append("6. Torch profiler duration 是事件耗时累计，不完全等同 wall-clock latency。")
+    lines.append(f"7. 基于 torch profiler rank {rank_selector} trace 文件生成。")
+    lines.append(f"8. parsed events: {parsed_events:,}；dedup true gpu kernel events: {gpu_events:,}。")
+    lines.append("9. 当前统计的是 kernel duration，不是通信 bytes；如需通信 bytes，需要 record_shapes 或 all_reduce 插桩。")
+    lines.append("10. parser/schema 或采集版本变化会使 total kernel time 与旧报告不可直接比较，不对 duration 做缩放。")
     lines.append("")
 
-    cuda_detail_rows = build_op_kernel_rows(all_kernel_aggs, total_ref, non_comm_ref, top_kernels_per_op)
+    cuda_detail_rows = build_op_kernel_rows(all_kernel_aggs, total_ref, residual_ref, top_kernels_per_op)
     cuda_rows = build_mentor_cuda_rows(cuda_detail_rows)
-    mentor_kernel_headers = ["source file", "op_name", "kernel_name", "调用次数", "总时间(ms)", "平均时间(us)", "占比"]
-    lines.append("## CUDA kernel（按总时间排序）")
+    mentor_kernel_headers = ["source_file", "op_name", "kernel_name", "调用次数", "总时间(ms)", "平均时间(us)", "pct", "pct_denom", "overall_pct", "source_type", "provider", "op_kind"]
+    lines.append("## Mentor Style CUDA Kernel（按 op_name 聚合）")
     lines.append("")
     lines.append(md_table(mentor_kernel_headers, cuda_rows))
     lines.append("")
@@ -1861,6 +1934,12 @@ def build_markdown(
             "source_file": source_file,
             "calls": agg.calls,
             "total_us": agg.total_us,
+            "source_type": agg.source_type,
+            "provider": agg.provider,
+            "op_kind": agg.op_kind,
+            "communication_type": agg.communication_type,
+            "confidence": agg.confidence,
+            "needs_source_check": agg.needs_source_check,
         }
         for (kind, op_name, kernel_name, source_file), agg in all_kernel_aggs
     ]
@@ -1886,7 +1965,11 @@ def build_markdown(
     lines.append("")
     lines.append(md_table(["字段", "值"], credibility_rows))
     lines.append("")
-    lines.append("说明：如果 trace 不包含 stack 或 launch correlation，source_file 可能为空；unknown_op_pct 越高，表示 kernel 到 cpu_op 的关联越不完整。source_map 是候选源码路径，不是 profiler 原生 stack。")
+    lines.append("说明：主表不会留空 op_name/source_file；缺少精确证据时使用 unresolved fallback，并保持 source_type=unknown。source_map 和 kernel_name_mapping 是候选源码证据，不是 profiler 原生 stack。")
+    raw_gpu_us = sum(stat.raw_gpu_kernel_us for stat in profile.rank_stats.values())
+    dedup_delta = ((raw_gpu_us - profile.total_kernel_us) / raw_gpu_us) if raw_gpu_us else 0.0
+    if dedup_delta > 0.05:
+        lines.append(f"> WARNING: GPU kernel 去重前后时间差异为 {dedup_delta * 100.0:.2f}%，超过 5%，请检查 trace 是否包含重复事件。")
     lines.append("")
     tables.append({"sheet_name": "Credibility", "headers": ["字段", "值"], "rows": credibility_rows})
 
@@ -1966,7 +2049,7 @@ def build_markdown(
 
     lines.append("## True GPU Kernel 明细（含 source_type / op_kind / overall_pct）")
     lines.append("")
-    kernel_headers = ["source file", "source_type", "op_name", "op_kind", "kernel_name", "调用次数", "总时间(ms)", "平均时间(us)", "占比", "overall_pct"]
+    kernel_headers = mentor_kernel_headers
     lines.append(md_table(kernel_headers, cuda_detail_rows))
     lines.append("")
     tables.append({"sheet_name": "CUDA_GPU_Kernel_Detail", "headers": kernel_headers, "rows": cuda_detail_rows})
@@ -2109,6 +2192,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-reparse", type=str, default="false", help="强制重扫 trace: true/false")
     parser.add_argument("--top-k", type=int, default=200, help="保留参数：Top 表行数")
     parser.add_argument("--top-kernels-per-op", type=int, default=8, help="每个 op 展示的 kernel_name 数量")
+    parser.add_argument("--pct-mode", choices=("mentor",), default="mentor", help="百分比口径，默认 mentor")
     parser.add_argument("--source-map", type=str, default=None, help="kernel/source 静态映射 YAML/JSON")
     parser.add_argument("--config-path", type=str, default=None, help="本次报告使用的模型配置文件")
     parser.add_argument("--expected-model", type=str, default=None, help="launcher 解析出的模型名")
@@ -2190,6 +2274,7 @@ def main() -> int:
         model_name=model_name,
         top_kernels_per_op=args.top_kernels_per_op,
         comm_mappings=comm_mappings,
+        pct_mode=args.pct_mode,
     )
     md_path = output_dir / "sglang_perf_analysis_torch.md"
     xlsx_path = output_dir / "sglang_perf_analysis_torch.xlsx"
