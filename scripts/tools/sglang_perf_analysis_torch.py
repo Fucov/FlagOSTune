@@ -132,8 +132,17 @@ class KernelRecord:
 class RankStats:
     rank: int
     total_kernel_us: float = 0.0
+    raw_gpu_kernel_us: float = 0.0
+    duplicate_gpu_kernel_us_filtered: float = 0.0
+    raw_comm_kernel_us: float = 0.0
+    dedup_comm_kernel_us: float = 0.0
+    duplicate_comm_event_filtered_us: float = 0.0
     parsed_events: int = 0
+    raw_gpu_kernel_events: int = 0
     gpu_kernel_events: int = 0
+    duplicate_gpu_kernel_events_filtered: int = 0
+    raw_comm_kernel_events: int = 0
+    dedup_comm_kernel_events: int = 0
     profiler_events: int = 0
     cpu_op_events: int = 0
     cuda_runtime_events: int = 0
@@ -168,7 +177,7 @@ class ProfileStats:
         )
 
 
-CACHE_SCHEMA_VERSION = 4
+CACHE_SCHEMA_VERSION = 5
 
 
 def get_project_root() -> Path:
@@ -511,6 +520,30 @@ def get_correlation_key(event: Dict[str, Any]) -> str:
     return ""
 
 
+def gpu_event_fingerprint(event: Dict[str, Any], rank: int) -> Tuple[str, ...]:
+    """Return a conservative identity for exact duplicate GPU trace events."""
+    args = event_args(event)
+
+    def value(*names: str) -> str:
+        for name in names:
+            if name in args:
+                return str(args[name])
+        return ""
+
+    return (
+        str(rank),
+        str(event.get("ts", "")),
+        str(event.get("dur", "")),
+        str(event.get("pid", "")),
+        str(event.get("tid", "")),
+        normalize_name(str(event.get("name", "unknown"))),
+        get_correlation_key(event),
+        get_external_key(event),
+        value("device", "Device", "device id", "Device Id"),
+        value("stream", "Stream", "stream id", "Stream Id"),
+    )
+
+
 def extract_source_from_args(args: Dict[str, Any]) -> str:
     for key in ("Source Location", "source", "Source", "file", "File", "filename", "Filename"):
         value = args.get(key)
@@ -657,8 +690,17 @@ def load_rank_stats_from_cache(path: Path, rank: int, kernel_cache: Path, event_
 
     stats = RankStats(rank=rank)
     stats.total_kernel_us = float(kernel_payload.get("total_kernel_us", 0.0))
+    stats.raw_gpu_kernel_us = float(kernel_payload.get("raw_gpu_kernel_us", stats.total_kernel_us))
+    stats.duplicate_gpu_kernel_us_filtered = float(kernel_payload.get("duplicate_gpu_kernel_us_filtered", 0.0))
+    stats.raw_comm_kernel_us = float(kernel_payload.get("raw_comm_kernel_us", 0.0))
+    stats.dedup_comm_kernel_us = float(kernel_payload.get("dedup_comm_kernel_us", 0.0))
+    stats.duplicate_comm_event_filtered_us = float(kernel_payload.get("duplicate_comm_event_filtered_us", 0.0))
     stats.parsed_events = int(kernel_payload.get("parsed_events", 0))
     stats.gpu_kernel_events = int(kernel_payload.get("gpu_kernel_events", 0))
+    stats.raw_gpu_kernel_events = int(kernel_payload.get("raw_gpu_kernel_events", stats.gpu_kernel_events))
+    stats.duplicate_gpu_kernel_events_filtered = int(kernel_payload.get("duplicate_gpu_kernel_events_filtered", 0))
+    stats.raw_comm_kernel_events = int(kernel_payload.get("raw_comm_kernel_events", 0))
+    stats.dedup_comm_kernel_events = int(kernel_payload.get("dedup_comm_kernel_events", 0))
     stats.profiler_events = int(kernel_payload.get("profiler_events", 0))
     stats.cpu_op_events = int(kernel_payload.get("cpu_op_events", 0))
     stats.cuda_runtime_events = int(kernel_payload.get("cuda_runtime_events", 0))
@@ -681,8 +723,17 @@ def write_rank_stats_cache(path: Path, stats: RankStats, kernel_cache: Path, eve
         "trace": trace_metadata(path),
         "rank": stats.rank,
         "total_kernel_us": stats.total_kernel_us,
+        "raw_gpu_kernel_us": stats.raw_gpu_kernel_us,
+        "duplicate_gpu_kernel_us_filtered": stats.duplicate_gpu_kernel_us_filtered,
+        "raw_comm_kernel_us": stats.raw_comm_kernel_us,
+        "dedup_comm_kernel_us": stats.dedup_comm_kernel_us,
+        "duplicate_comm_event_filtered_us": stats.duplicate_comm_event_filtered_us,
         "parsed_events": stats.parsed_events,
         "gpu_kernel_events": stats.gpu_kernel_events,
+        "raw_gpu_kernel_events": stats.raw_gpu_kernel_events,
+        "duplicate_gpu_kernel_events_filtered": stats.duplicate_gpu_kernel_events_filtered,
+        "raw_comm_kernel_events": stats.raw_comm_kernel_events,
+        "dedup_comm_kernel_events": stats.dedup_comm_kernel_events,
         "profiler_events": stats.profiler_events,
         "cpu_op_events": stats.cpu_op_events,
         "cuda_runtime_events": stats.cuda_runtime_events,
@@ -770,6 +821,7 @@ def parse_trace_file(
     cpu_op_by_external_id: Dict[str, str] = {}
     source_by_external_id: Dict[str, str] = {}
     runtime_external_by_correlation: Dict[str, str] = {}
+    seen_gpu_events: set[Tuple[str, ...]] = set()
     rank_stats = RankStats(rank=rank)
     started_at = time.time()
 
@@ -806,6 +858,22 @@ def parse_trace_file(
         if is_gpu_kernel_event(event):
             mapped_external_key = external_key or runtime_external_by_correlation.get(correlation_key, "")
             op_name = cpu_op_by_external_id.get(mapped_external_key, "")
+            is_raw_comm = is_comm_text(name, op_name)
+            rank_stats.raw_gpu_kernel_events += 1
+            rank_stats.raw_gpu_kernel_us += float(dur)
+            if is_raw_comm:
+                rank_stats.raw_comm_kernel_events += 1
+                rank_stats.raw_comm_kernel_us += float(dur)
+            fingerprint = gpu_event_fingerprint(event, rank)
+            if fingerprint in seen_gpu_events:
+                rank_stats.duplicate_gpu_kernel_events_filtered += 1
+                rank_stats.duplicate_gpu_kernel_us_filtered += float(dur)
+                if is_raw_comm:
+                    rank_stats.duplicate_comm_event_filtered_count += 1
+                    rank_stats.duplicate_comm_event_filtered_us += float(dur)
+                update_progress(rank_stats, progress_every, started_at)
+                continue
+            seen_gpu_events.add(fingerprint)
             direct_source = extract_source_from_args(args)
             correlated_source = source_by_external_id.get(mapped_external_key, "")
             source_file = direct_source or correlated_source
@@ -821,6 +889,9 @@ def parse_trace_file(
             )
             rank_stats.total_kernel_us += float(dur)
             rank_stats.gpu_kernel_events += 1
+            if is_raw_comm:
+                rank_stats.dedup_comm_kernel_events += 1
+                rank_stats.dedup_comm_kernel_us += float(dur)
             rank_stats.kernel_aggs[(kind.value, op_name or "unknown", name, source_file)].add(float(dur))
             if is_distributed_kind(kind):
                 rank_stats.distributed[kind].add(float(dur))
@@ -829,8 +900,6 @@ def parse_trace_file(
             rank_stats.profiler_events += 1
             source_file = source_by_external_id.get(external_key, "") or extract_source_from_args(args)
             rank_stats.event_hotspots[(cat or "unknown", source_file, name)].add(float(dur))
-            if is_comm_text(name, cat, source_file):
-                rank_stats.duplicate_comm_event_filtered_count += 1
 
         update_progress(rank_stats, progress_every, started_at)
 
@@ -850,8 +919,17 @@ def parse_trace_file(
 
 def merge_rank_stats(target: RankStats, source: RankStats) -> None:
     target.total_kernel_us += source.total_kernel_us
+    target.raw_gpu_kernel_us += source.raw_gpu_kernel_us
+    target.duplicate_gpu_kernel_us_filtered += source.duplicate_gpu_kernel_us_filtered
+    target.raw_comm_kernel_us += source.raw_comm_kernel_us
+    target.dedup_comm_kernel_us += source.dedup_comm_kernel_us
+    target.duplicate_comm_event_filtered_us += source.duplicate_comm_event_filtered_us
     target.parsed_events += source.parsed_events
     target.gpu_kernel_events += source.gpu_kernel_events
+    target.raw_gpu_kernel_events += source.raw_gpu_kernel_events
+    target.duplicate_gpu_kernel_events_filtered += source.duplicate_gpu_kernel_events_filtered
+    target.raw_comm_kernel_events += source.raw_comm_kernel_events
+    target.dedup_comm_kernel_events += source.dedup_comm_kernel_events
     target.profiler_events += source.profiler_events
     target.cpu_op_events += source.cpu_op_events
     target.cuda_runtime_events += source.cuda_runtime_events
@@ -876,6 +954,21 @@ def select_trace_files(report_dir: Path, rank_selector: str) -> List[Path]:
         )
     )
     trace_files = [path for path in trace_files if rank_matches(path, rank_selector)]
+    latest_by_rank: Dict[int, Path] = {}
+    for path in trace_files:
+        rank = extract_rank(path)
+        if rank is None:
+            rank = 0
+        current = latest_by_rank.get(rank)
+
+        def capture_key(candidate: Path) -> Tuple[float, int, str]:
+            match = re.match(r"(\d+(?:\.\d+)?)", candidate.name)
+            capture_time = float(match.group(1)) if match else candidate.stat().st_mtime
+            return capture_time, candidate.stat().st_mtime_ns, candidate.name
+
+        if current is None or capture_key(path) > capture_key(current):
+            latest_by_rank[rank] = path
+    trace_files = [latest_by_rank[rank] for rank in sorted(latest_by_rank)]
     if not trace_files:
         raise SystemExit(f"Missing SGLang trace file in {report_dir} for rank={rank_selector}")
     return trace_files

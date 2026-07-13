@@ -20,6 +20,7 @@ from scripts.tools.sglang_perf_analysis_torch import (
     iter_trace_events,
     parse_profile_dir_by_rank,
     report_type_for,
+    select_trace_files,
 )
 
 
@@ -378,6 +379,55 @@ class SGLangPerfAnalysisTorchTest(unittest.TestCase):
         self.assertEqual(extract_rank(Path("profile-TP-3-DP-0-PP-0-EP-0.trace.json")), 3)
         self.assertEqual(extract_rank(Path("profiler_out_7.txt")), 7)
         self.assertIsNone(extract_rank(Path("no-rank.pt.trace.json")))
+
+    def test_select_trace_files_uses_latest_root_trace_per_rank(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report-sglang"
+            report_dir.mkdir()
+            old_rank0 = report_dir / "1783500627.1491842-TP-0.trace.json.gz"
+            latest_rank0 = report_dir / "1783585090.6296785-TP-0.trace.json.gz"
+            rank1 = report_dir / "1783585090.6296785-TP-1.trace.json.gz"
+            for path in (old_rank0, latest_rank0, rank1):
+                path.write_bytes(b"{}")
+            archive = report_dir / "archive_before_latest_1783585090.6296785"
+            archive.mkdir()
+            (archive / "9999999999.0-TP-0.trace.json.gz").write_bytes(b"{}")
+
+            self.assertEqual(select_trace_files(report_dir, "0"), [latest_rank0])
+            self.assertEqual(select_trace_files(report_dir, "all"), [latest_rank0, rank1])
+
+    def test_parser_deduplicates_only_identical_gpu_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report-sglang"
+            report_dir.mkdir()
+            duplicate = kernel_event("ncclDevKernel_AllGather_RING_LL", 20.0)
+            duplicate.update({"pid": 3, "tid": 7, "ts": 10.0})
+            duplicate["args"].update({"correlation": 77, "device": 0, "stream": 4})
+            legitimate = json.loads(json.dumps(duplicate))
+            legitimate["ts"] = 11.0
+            write_trace(
+                report_dir / "1783585090.0-TP-0.trace.json",
+                [duplicate, json.loads(json.dumps(duplicate)), legitimate],
+            )
+
+            profile = parse_profile_dir_by_rank(
+                report_dir,
+                rank_selector="0",
+                progress_every=0,
+                use_cache=False,
+            )
+
+        stats = profile.rank_stats[0]
+        self.assertEqual(stats.raw_gpu_kernel_events, 3)
+        self.assertEqual(stats.raw_gpu_kernel_us, 60.0)
+        self.assertEqual(stats.gpu_kernel_events, 2)
+        self.assertEqual(stats.total_kernel_us, 40.0)
+        self.assertEqual(stats.duplicate_gpu_kernel_events_filtered, 1)
+        self.assertEqual(stats.duplicate_gpu_kernel_us_filtered, 20.0)
+        self.assertEqual(stats.raw_comm_kernel_events, 3)
+        self.assertEqual(stats.dedup_comm_kernel_events, 2)
+        self.assertEqual(stats.duplicate_comm_event_filtered_count, 1)
+        self.assertEqual(stats.duplicate_comm_event_filtered_us, 20.0)
 
     def test_parse_profile_dir_by_rank_aggregates_distributed_ops(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
