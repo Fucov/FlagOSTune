@@ -304,16 +304,39 @@ class SGLangPerfAnalysisTorchTest(unittest.TestCase):
         )
 
         self.assertIn("## Top 10 Kernel 源码核查表", markdown)
-        self.assertIn("## 通信算子拆解", markdown)
+        self.assertIn("## 明确通信算子拆解", markdown)
+        self.assertIn("## 可能通信融合 / 待确认算子", markdown)
         self.assertIn("## 当前可确认结论", markdown)
         self.assertIn("## 仍需源码确认项", markdown)
-        top_section = markdown.split("## Top 10 Kernel 源码核查表", 1)[1].split("## 通信算子拆解", 1)[0]
+        top_section = markdown.split("## Top 10 Kernel 源码核查表", 1)[1].split("## 明确通信算子拆解", 1)[0]
         self.assertEqual(sum(1 for line in top_section.splitlines() if re.match(r"\|\s*\d+\s*\|", line)), 10)
         self.assertIn("自研通信算子，不是 NCCL", markdown)
         self.assertIn("计算融合，不等价于通信融合", markdown)
         self.assertIn("FP8 GEMM 计算 kernel", markdown)
         self.assertNotIn("distributed_nccl_other", markdown)
         self.assertTrue(any(table["sheet_name"] == "Top10SourceAudit" for table in tables))
+
+    def test_report_separates_explicit_and_possible_communication(self) -> None:
+        formatter = self._comm_formatter()
+        rows = [
+            {"kind": "distributed_all_reduce", "op_name": "sglang::outplace_all_reduce", "kernel_name": "all_reduce_one_shot_push_kernel", "source_file": "sglang/srt/distributed/parallel_state.py", "calls": 2, "total_us": 100.0},
+            {"kind": "distributed_all_gather", "op_name": "record_param_comms", "kernel_name": "ncclDevKernel_AllGather_RING_LL", "source_file": "sglang/srt/distributed/device_communicators/pynccl.py", "calls": 1, "total_us": 20.0},
+            {"kind": "moe", "op_name": "sglang::outplace_fused_experts", "kernel_name": "fused_moe_kernel", "source_file": "sglang/srt/layers/moe/", "calls": 4, "total_us": 80.0},
+        ]
+        markdown, _ = formatter.build_focus_report_sections(
+            kernel_rows=rows,
+            event_rows=[{"event_name": "gloo:broadcast", "calls": 1, "total_us": 1.0, "source_file": ""}],
+            total_gpu_us=200.0,
+            mappings=[],
+        )
+
+        explicit = markdown.split("## 明确通信算子拆解", 1)[1].split("## 可能通信融合 / 待确认算子", 1)[0]
+        self.assertIn("SGLang Custom AllReduce", explicit)
+        self.assertIn("NCCL AllGather", explicit)
+        self.assertIn("Control Plane Broadcast", explicit)
+        self.assertNotIn("fused_moe_kernel", explicit)
+        self.assertIn("当前未在 Top GPU Kernel 中观察到明确 all_to_all / reduce_scatter / DeepEP / flashinfer.comm allreduce_fusion，因此 MoE/FlashInfer 通信融合不计入明确通信。", markdown)
+        self.assertIn("当前未观察到显式 all_to_all / reduce_scatter / DeepEP，因此 MoE fused_moe/topk/align/sum_reduce 只能归为 MoE compute/routing/local reduce，不能计入明确通信；是否存在 EP 通信融合需要结合配置和源码进一步确认。", markdown)
 
     def test_classify_distributed_op_covers_common_collectives(self) -> None:
         self.assertEqual(

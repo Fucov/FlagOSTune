@@ -299,21 +299,15 @@ def classify_kernel(
             current_judgment="FP8 GEMM 计算 kernel，未观察到本身融合通信",
         )
     if any(token in text for token in ("fused_moe_kernel", "topkgatingsoftmax", "moe_align", "moe_sum_reduce")):
-        comm_type = "moe_ep_possible" if has_explicit_ep_communication else "none"
-        judgment = (
-            "MoE 计算邻接显式 EP 通信，融合关系仍需确认"
-            if has_explicit_ep_communication
-            else "本地 MoE routing/expert 计算；无 all_to_all/reduce_scatter 证据时不是确定通信融合"
-        )
         return _result(
             provider="SGLang MoE/Triton",
             op_kind="MoE/Expert",
-            communication_type=comm_type,
+            communication_type="none",
             source_file=source_file,
-            confidence="high" if comm_type == "none" else "medium",
-            need_source_check=comm_type != "none",
+            confidence="high",
+            need_source_check=False,
             evidence="kernel_name",
-            current_judgment=judgment,
+            current_judgment="本地 MoE compute/routing/local reduce；即使存在独立 EP 通信，也不能把计算 kernel 本身计为通信",
         )
     if "_fwd_grouped_kernel_stage1" in text or re.search(r"(?:^|\W)_fwd_kernel(?:\W|$)", text):
         return _result(
@@ -548,12 +542,7 @@ def build_focus_report_sections(
     comm_rows: List[List[Any]] = []
     for summary in summaries:
         classification = summary.classification
-        if classification.communication_type not in {
-            "custom_all_reduce",
-            "nccl",
-            "flashinfer_comm_fusion",
-            "moe_ep_possible",
-        }:
+        if classification.communication_type not in {"custom_all_reduce", "nccl"}:
             continue
         comm_rows.append(
             [
@@ -568,7 +557,7 @@ def build_focus_report_sections(
                 _fmt_us(summary.avg_us),
                 _fmt_pct(summary.total_us, total_gpu_us),
                 classification.evidence,
-                "yes" if classification.communication_type in {"custom_all_reduce", "nccl"} else "possible",
+                "yes",
             ]
         )
     for event in event_rows:
@@ -600,8 +589,48 @@ def build_focus_report_sections(
                 "no",
             ]
         )
-    lines.extend(("## 通信算子拆解", "", _md_table(comm_headers, comm_rows), ""))
-    tables.append({"sheet_name": "CommunicationBreakdown", "headers": comm_headers, "rows": comm_rows})
+    lines.extend(("## 明确通信算子拆解", "", _md_table(comm_headers, comm_rows), ""))
+    tables.append({"sheet_name": "ExplicitCommunication", "headers": comm_headers, "rows": comm_rows})
+
+    possible_rows: List[List[Any]] = []
+    possible_tokens = ("all_to_all", "alltoall", "reduce_scatter", "reducescatter", "deepep", "dispatch", "combine", "flashinfer.comm", "allreduce_fusion")
+    for summary in summaries:
+        text = " ".join((summary.kernel_name, summary.op_name, summary.source_file)).lower()
+        if not any(token in text for token in possible_tokens):
+            continue
+        classification = summary.classification
+        possible_rows.append([
+            _communication_label(summary),
+            classification.provider,
+            summary.kernel_name,
+            summary.op_name,
+            summary.source_file,
+            classification.source_type,
+            summary.calls,
+            _fmt_ms(summary.total_us),
+            _fmt_us(summary.avg_us),
+            _fmt_pct(summary.total_us, total_gpu_us),
+            "kernel/event name contains EP or communication-fusion evidence",
+            "possible",
+        ])
+    for event in event_rows:
+        event_name = str(event.get("event_name") or event.get("name") or "")
+        if not any(token in event_name.lower() for token in possible_tokens):
+            continue
+        total_us = float(event.get("total_us") or 0.0)
+        calls = int(event.get("calls") or 0)
+        possible_rows.append([
+            "Possible Fused Communication", "Unknown", event_name, event_name,
+            str(event.get("source_file") or "unresolved/source-check-required"), "unknown",
+            calls, _fmt_ms(total_us), _fmt_us(total_us / calls if calls else 0.0),
+            _fmt_pct(total_us, total_gpu_us), "profiler event name", "possible",
+        ])
+    lines.extend(("## 可能通信融合 / 待确认算子", ""))
+    if possible_rows:
+        lines.extend((_md_table(comm_headers, possible_rows), ""))
+    else:
+        lines.extend(("当前未在 Top GPU Kernel 中观察到明确 all_to_all / reduce_scatter / DeepEP / flashinfer.comm allreduce_fusion，因此 MoE/FlashInfer 通信融合不计入明确通信。", ""))
+    tables.append({"sheet_name": "PossibleFusedCommunication", "headers": comm_headers, "rows": possible_rows})
 
     custom = [item for item in summaries if item.classification.communication_type == "custom_all_reduce"]
     nccl = [item for item in summaries if item.classification.communication_type == "nccl"]
@@ -637,7 +666,11 @@ def build_focus_report_sections(
             "",
             f"4. DeepGEMM 合计 {_fmt_ms(deep_gemm_us)} ms，占 overall {_fmt_pct(deep_gemm_us, total_gpu_us)}；它是 FP8 GEMM 计算 kernel，当前未观察到本身融合通信。",
             "",
-            f"5. MoE 相关 Top kernel 包括 {moe_names}。当前{'已观察到' if has_ep_comm else '未观察到'}显式 all_to_all / reduce_scatter / DeepEP，因此{'只能标记为 EP communication possible，不能仅凭 MoE kernel 断言融合' if has_ep_comm else '不能断言 MoE EP 通信融合是主瓶颈'}。",
+            (
+                f"5. MoE 相关 Top kernel 包括 {moe_names}。已观察到独立 all_to_all / reduce_scatter / DeepEP 证据；这些通信单独列入可能通信表，MoE compute kernel 本身仍不计为明确通信。"
+                if has_ep_comm
+                else "5. 当前未观察到显式 all_to_all / reduce_scatter / DeepEP，因此 MoE fused_moe/topk/align/sum_reduce 只能归为 MoE compute/routing/local reduce，不能计入明确通信；是否存在 EP 通信融合需要结合配置和源码进一步确认。"
+            ),
             "",
         )
     )
