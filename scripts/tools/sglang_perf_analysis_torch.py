@@ -108,10 +108,21 @@ REAL_COMMUNICATION_KEYWORDS = (
 class Aggregate:
     calls: int = 0
     total_us: float = 0.0
+    op_name: str = ""
+    source_file: str = ""
+    source_type: str = "unknown"
+    provider: str = "Unknown"
+    op_kind: str = ""
+    communication_type: str = "unknown"
+    confidence: str = "low"
+    needs_source_check: bool = False
 
-    def add(self, dur_us: float, calls: int = 1) -> None:
+    def add(self, dur_us: float, calls: int = 1, **metadata: Any) -> None:
         self.calls += calls
         self.total_us += dur_us
+        for name, value in metadata.items():
+            if hasattr(self, name) and value not in (None, ""):
+                setattr(self, name, value)
 
     @property
     def avg_us(self) -> float:
@@ -604,6 +615,22 @@ def load_source_map(path: Optional[Path]) -> List[Dict[str, Any]]:
     return [item for item in data if isinstance(item, dict)]
 
 
+def match_kernel_mapping(
+    mappings: Sequence[Dict[str, Any]], kernel_name: str
+) -> Optional[Dict[str, Any]]:
+    for item in mappings:
+        pattern = str(item.get("pattern") or "")
+        if not pattern:
+            continue
+        try:
+            matched = re.search(pattern, kernel_name, flags=re.IGNORECASE) is not None
+        except re.error:
+            matched = pattern.lower() in kernel_name.lower()
+        if matched:
+            return item
+    return None
+
+
 def apply_source_map(
     source_map: List[Dict[str, Any]],
     *,
@@ -611,7 +638,7 @@ def apply_source_map(
     op_name: str,
     kernel_name: str,
     source_file: str,
-) -> Tuple[OpKind, str, str]:
+) -> Tuple[OpKind, str, str, str]:
     haystack = {
         "kernel_name": kernel_name,
         "op_name": op_name,
@@ -639,11 +666,13 @@ def apply_source_map(
                 mapped_kind = kind
         mapped_op = str(item.get("op_name_override") or op_name or "unknown")
         mapped_source = source_file
+        source_type = "unknown"
         if not mapped_source and item.get("source_file_guess"):
             confidence = str(item.get("confidence", "medium"))
-            mapped_source = f"{item.get('source_file_guess')} [source_map:{confidence}]"
-        return mapped_kind, mapped_op, mapped_source
-    return kind, op_name, source_file
+            mapped_source = str(item.get("source_file_guess"))
+            source_type = f"source_map_{confidence}"
+        return mapped_kind, mapped_op, mapped_source, source_type
+    return kind, op_name, source_file, "unknown"
 
 
 def cache_paths(output_dir: Optional[Path], rank: int) -> Tuple[Optional[Path], Optional[Path]]:
@@ -660,7 +689,21 @@ def summary_cache_path(output_dir: Optional[Path], rank: int) -> Optional[Path]:
 def serialize_aggregate_map(data: Dict[Tuple[str, ...], Aggregate]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for key, agg in data.items():
-        rows.append({"key": list(key), "calls": agg.calls, "total_us": agg.total_us})
+        rows.append({
+            "key": list(key),
+            "calls": agg.calls,
+            "total_us": agg.total_us,
+            "metadata": {
+                "op_name": agg.op_name,
+                "source_file": agg.source_file,
+                "source_type": agg.source_type,
+                "provider": agg.provider,
+                "op_kind": agg.op_kind,
+                "communication_type": agg.communication_type,
+                "confidence": agg.confidence,
+                "needs_source_check": agg.needs_source_check,
+            },
+        })
     return rows
 
 
@@ -670,7 +713,8 @@ def load_aggregate_map(rows: Iterable[Dict[str, Any]]) -> DefaultDict[Tuple[str,
         key = tuple(str(item) for item in row.get("key", []))
         if not key:
             continue
-        out[key].add(float(row.get("total_us", 0.0)), int(row.get("calls", 0)))
+        metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+        out[key].add(float(row.get("total_us", 0.0)), int(row.get("calls", 0)), **metadata)
     return out
 
 
@@ -811,6 +855,7 @@ def parse_trace_file(
     output_dir: Optional[Path] = None,
     use_cache: bool = True,
     source_map: Optional[List[Dict[str, Any]]] = None,
+    kernel_mappings: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> RankStats:
     kernel_cache, event_cache = cache_paths(output_dir, rank)
     if use_cache and kernel_cache is not None and event_cache is not None:
@@ -877,22 +922,53 @@ def parse_trace_file(
             direct_source = extract_source_from_args(args)
             correlated_source = source_by_external_id.get(mapped_external_key, "")
             source_file = direct_source or correlated_source
-            if not direct_source and correlated_source:
-                source_file = f"{correlated_source} [correlation]"
+            source_type = "profiler_stack" if direct_source else ("correlation" if correlated_source else "unknown")
             kind = classify_op_kind(name, op_name, source_file)
-            kind, op_name, source_file = apply_source_map(
-                source_map or [],
-                kind=kind,
-                op_name=op_name or "unknown",
-                kernel_name=name,
-                source_file=source_file,
-            )
+            mapping = match_kernel_mapping(kernel_mappings or (), name)
+            provider = "Unknown"
+            op_kind = ""
+            communication_type = "unknown"
+            confidence = "low"
+            needs_source_check = False
+            if mapping is not None:
+                if not op_name:
+                    op_name = str(mapping.get("op_name") or "")
+                if not source_file:
+                    source_file = str(mapping.get("source_file") or "")
+                    if source_file:
+                        source_type = "kernel_name_mapping"
+                provider = str(mapping.get("provider") or provider)
+                op_kind = str(mapping.get("op_kind") or op_kind)
+                communication_type = str(mapping.get("communication_type") or communication_type)
+                confidence = str(mapping.get("confidence") or confidence)
+                needs_source_check = bool(mapping.get("needs_source_check", False))
+            if not source_file or not op_name:
+                kind, op_name, mapped_source, mapped_source_type = apply_source_map(
+                    source_map or [],
+                    kind=kind,
+                    op_name=op_name or "unknown",
+                    kernel_name=name,
+                    source_file=source_file,
+                )
+                if not source_file and mapped_source:
+                    source_file = mapped_source
+                    source_type = mapped_source_type
             rank_stats.total_kernel_us += float(dur)
             rank_stats.gpu_kernel_events += 1
             if is_raw_comm:
                 rank_stats.dedup_comm_kernel_events += 1
                 rank_stats.dedup_comm_kernel_us += float(dur)
-            rank_stats.kernel_aggs[(kind.value, op_name or "unknown", name, source_file)].add(float(dur))
+            rank_stats.kernel_aggs[(kind.value, op_name or "unknown", name, source_file)].add(
+                float(dur),
+                op_name=op_name or "unknown",
+                source_file=source_file,
+                source_type=source_type,
+                provider=provider,
+                op_kind=op_kind,
+                communication_type=communication_type,
+                confidence=confidence,
+                needs_source_check=needs_source_check,
+            )
             if is_distributed_kind(kind):
                 rank_stats.distributed[kind].add(float(dur))
                 rank_stats.distributed_events += 1
@@ -939,7 +1015,18 @@ def merge_rank_stats(target: RankStats, source: RankStats) -> None:
     for kind, agg in source.distributed.items():
         target.distributed[kind].add(agg.total_us, agg.calls)
     for key, agg in source.kernel_aggs.items():
-        target.kernel_aggs[key].add(agg.total_us, agg.calls)
+        target.kernel_aggs[key].add(
+            agg.total_us,
+            agg.calls,
+            op_name=agg.op_name,
+            source_file=agg.source_file,
+            source_type=agg.source_type,
+            provider=agg.provider,
+            op_kind=agg.op_kind,
+            communication_type=agg.communication_type,
+            confidence=agg.confidence,
+            needs_source_check=agg.needs_source_check,
+        )
     for key, agg in source.event_hotspots.items():
         target.event_hotspots[key].add(agg.total_us, agg.calls)
 
@@ -983,6 +1070,7 @@ def parse_profile_dir_by_rank(
     output_dir: Optional[Path] = None,
     use_cache: bool = True,
     source_map: Optional[List[Dict[str, Any]]] = None,
+    kernel_mappings: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> ProfileStats:
     trace_files = select_trace_files(report_dir, rank_selector)
 
@@ -999,6 +1087,7 @@ def parse_profile_dir_by_rank(
             output_dir=output_dir,
             use_cache=use_cache,
             source_map=source_map,
+            kernel_mappings=kernel_mappings,
         )
         if rank not in rank_stats:
             rank_stats[rank] = RankStats(rank=rank)
@@ -1062,7 +1151,18 @@ def aggregate_kernel_aggs(profile: ProfileStats) -> List[Tuple[Tuple[str, str, s
     out: Dict[Tuple[str, str, str, str], Aggregate] = defaultdict(Aggregate)
     for stat in profile.rank_stats.values():
         for key, agg in stat.kernel_aggs.items():
-            out[key].add(agg.total_us, agg.calls)
+            out[key].add(
+                agg.total_us,
+                agg.calls,
+                op_name=agg.op_name,
+                source_file=agg.source_file,
+                source_type=agg.source_type,
+                provider=agg.provider,
+                op_kind=agg.op_kind,
+                communication_type=agg.communication_type,
+                confidence=agg.confidence,
+                needs_source_check=agg.needs_source_check,
+            )
     if out:
         return sorted(out.items(), key=lambda item: item[1].total_us, reverse=True)
     all_records = [record for stat in profile.rank_stats.values() for record in stat.kernels]
@@ -2068,6 +2168,9 @@ def main() -> int:
     comm_mappings = load_kernel_mappings(
         get_project_root() / "scripts" / "tools" / "sglang_comm_kernel_mapping.yaml"
     )
+    kernel_mappings = load_kernel_mappings(
+        get_project_root() / "scripts" / "tools" / "sglang_kernel_name_mapping.yaml"
+    )
     use_cache = str(args.use_cache).lower() in {"1", "true", "yes", "on"} and str(args.force_reparse).lower() not in {"1", "true", "yes", "on"}
 
     profile = parse_profile_dir_by_rank(
@@ -2078,6 +2181,7 @@ def main() -> int:
         output_dir=output_dir,
         use_cache=use_cache,
         source_map=source_map,
+        kernel_mappings=kernel_mappings,
     )
     model_name = str(validated_identity["model_name"])
     markdown, tables = build_markdown(

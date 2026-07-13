@@ -429,6 +429,70 @@ class SGLangPerfAnalysisTorchTest(unittest.TestCase):
         self.assertEqual(stats.duplicate_comm_event_filtered_count, 1)
         self.assertEqual(stats.duplicate_comm_event_filtered_us, 20.0)
 
+    def test_kernel_mapping_preserves_provenance_priority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = Path(tmp) / "report-sglang"
+            report_dir.mkdir()
+            direct = kernel_event("RMSNormKernel", 10.0)
+            direct["args"]["Source Location"] = "native/profiler.py:10"
+            correlated_cpu = cpu_op_event("aten::mm", 22)
+            correlated_cpu["args"]["Source Location"] = "model/layer.py:20"
+            correlated = kernel_event("deep_gemm::sm90_fp8_gemm", 20.0, 22)
+            mapped = kernel_event("fused_moe_kernel", 30.0)
+            source_mapped = kernel_event("source_only_kernel", 40.0)
+            write_trace(
+                report_dir / "1783585090.0-TP-0.trace.json",
+                [direct, correlated_cpu, correlated, mapped, source_mapped],
+            )
+            kernel_mappings = [
+                {
+                    "pattern": "RMSNormKernel",
+                    "op_name": "flashinfer::rmsnorm",
+                    "source_file": "mapping/should_not_replace.py",
+                    "source_type": "kernel_name_mapping",
+                    "provider": "FlashInfer",
+                    "op_kind": "Norm/Fused Norm",
+                    "communication_type": "none",
+                    "confidence": "medium",
+                },
+                {
+                    "pattern": "fused_moe_kernel",
+                    "op_name": "sglang::outplace_fused_experts",
+                    "source_file": "sglang/srt/layers/moe/",
+                    "source_type": "kernel_name_mapping",
+                    "provider": "SGLang MoE/Triton",
+                    "op_kind": "MoE/Expert",
+                    "communication_type": "none",
+                    "confidence": "medium",
+                },
+            ]
+            source_map = [
+                {
+                    "pattern": "source_only_kernel",
+                    "match_field": "kernel_name",
+                    "source_file_guess": "sglang/srt/unknown/source_candidate.py",
+                    "confidence": "low",
+                }
+            ]
+
+            profile = parse_profile_dir_by_rank(
+                report_dir,
+                rank_selector="0",
+                progress_every=0,
+                use_cache=False,
+                source_map=source_map,
+                kernel_mappings=kernel_mappings,
+            )
+
+        aggs = {key[2]: agg for key, agg in profile.rank_stats[0].kernel_aggs.items()}
+        self.assertEqual(aggs["RMSNormKernel"].source_type, "profiler_stack")
+        self.assertEqual(aggs["RMSNormKernel"].source_file, "native/profiler.py:10")
+        self.assertEqual(aggs["deep_gemm::sm90_fp8_gemm"].source_type, "correlation")
+        self.assertEqual(aggs["deep_gemm::sm90_fp8_gemm"].source_file, "model/layer.py:20")
+        self.assertEqual(aggs["fused_moe_kernel"].source_type, "kernel_name_mapping")
+        self.assertEqual(aggs["fused_moe_kernel"].op_name, "sglang::outplace_fused_experts")
+        self.assertEqual(aggs["source_only_kernel"].source_type, "source_map_low")
+
     def test_parse_profile_dir_by_rank_aggregates_distributed_ops(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             report_dir = Path(tmp) / "report-sglang"

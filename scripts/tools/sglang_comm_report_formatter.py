@@ -56,6 +56,8 @@ def load_kernel_mappings(path: Path) -> List[Dict[str, Any]]:
 
 def infer_source_type(source_file: str, *, used_mapping: Optional[Dict[str, Any]] = None) -> str:
     text = str(source_file or "")
+    if used_mapping is not None and used_mapping.get("source_file"):
+        return str(used_mapping.get("source_type") or "kernel_name_mapping")
     if "[correlation]" in text:
         return "correlation"
     match = re.search(r"\[source_map:(high|medium|low)\]", text, flags=re.IGNORECASE)
@@ -64,10 +66,7 @@ def infer_source_type(source_file: str, *, used_mapping: Optional[Dict[str, Any]
     if text:
         return "profiler_stack"
     if used_mapping is not None:
-        confidence = str(used_mapping.get("confidence", "low")).lower()
-        if confidence not in {"high", "medium", "low"}:
-            confidence = "low"
-        return f"source_map_{confidence}"
+        return str(used_mapping.get("source_type") or "kernel_name_mapping")
     return "unknown"
 
 
