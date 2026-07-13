@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,6 +66,36 @@ benchmark:
             saved = json.loads((metadata_dir / "run_metadata.json").read_text(encoding="utf-8"))
             self.assertEqual(saved["trace"]["trace_files"]["value"][0]["size_bytes"], trace_path.stat().st_size)
             self.assertTrue((metadata_dir / "nvidia_smi_after_profile.txt").exists())
+
+    def test_collect_metadata_records_profile_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.yaml.TestModel"
+            config_path.write_text(
+                "model:\n  name: TestModel\nbenchmark:\n  scenarios:\n    optimized:\n      - name: smoke\n        input_len: 1\n        output_len: 1\n        concurrency: 1\n",
+                encoding="utf-8",
+            )
+            old = os.environ.get("SGLANG_TORCH_PROFILER_DETAIL")
+            os.environ["SGLANG_TORCH_PROFILER_DETAIL"] = "full_stack"
+            try:
+                metadata = collect_metadata(
+                    model_name="TestModel",
+                    config_path=config_path,
+                    output_dir=root / "metadata",
+                    report_dir=root / "report",
+                    trace_dir=None,
+                    selected_rank="0",
+                    phase="after_profile",
+                    workflow_command="test",
+                    processing_command="test",
+                    nvidia_smi_text="",
+                )
+            finally:
+                if old is None:
+                    os.environ.pop("SGLANG_TORCH_PROFILER_DETAIL", None)
+                else:
+                    os.environ["SGLANG_TORCH_PROFILER_DETAIL"] = old
+        self.assertEqual(metadata["trace"]["profiler_config"]["detail"], "full_stack")
 
 
 if __name__ == "__main__":

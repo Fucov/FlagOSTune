@@ -33,6 +33,7 @@ TORCH_RECORD_SHAPES="false"
 TORCH_PROFILE_MEMORY="false"
 TORCH_WITH_MODULES="false"
 TORCH_PROFILER_LIGHT="true"
+PROFILE_DETAIL="light"
 
 usage() {
     head -12 "$0" | tail -9
@@ -85,6 +86,10 @@ parse_args() {
                 TORCH_PROFILER_LIGHT="$2"
                 shift 2
                 ;;
+            --profile-detail)
+                PROFILE_DETAIL="$2"
+                shift 2
+                ;;
             -h|--help)
                 usage
                 exit 0
@@ -117,6 +122,13 @@ validate_args() {
         log_error "SGLang 当前入口只支持 --torch profiling"
         exit 1
     fi
+    case "$PROFILE_DETAIL" in
+        light|full_stack) ;;
+        *)
+            log_error "--profile-detail 仅支持 light|full_stack，当前值: $PROFILE_DETAIL"
+            exit 1
+            ;;
+    esac
 }
 
 main() {
@@ -139,6 +151,7 @@ main() {
     args+=("--torch-profile-memory" "$TORCH_PROFILE_MEMORY")
     args+=("--torch-with-modules" "$TORCH_WITH_MODULES")
     args+=("--torch-profiler-light" "$TORCH_PROFILER_LIGHT")
+    args+=("--profile-detail" "$PROFILE_DETAIL")
 
     log_info "SGLang profiling workflow"
     log_info "模型配置: config.yaml.${MODEL_CONFIG}"

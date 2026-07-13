@@ -293,6 +293,7 @@ def collect_metadata(
             "workflow_command": field(workflow_command, "argument"),
             "processing_command": field(processing_command, "argument"),
             "profiler_config": {
+                "detail": os.environ.get("SGLANG_TORCH_PROFILER_DETAIL", "light"),
                 "light": os.environ.get("SGLANG_TORCH_PROFILER_LIGHT"),
                 "with_stack": os.environ.get("SGLANG_TORCH_PROFILER_WITH_STACK"),
                 "record_shapes": os.environ.get("SGLANG_TORCH_PROFILER_RECORD_SHAPES"),

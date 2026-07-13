@@ -33,6 +33,7 @@ TORCH_RECORD_SHAPES="false"
 TORCH_PROFILE_MEMORY="false"
 TORCH_WITH_MODULES="false"
 TORCH_PROFILER_LIGHT="true"
+PROFILE_DETAIL="light"
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -79,6 +80,10 @@ parse_args() {
                 ;;
             --torch-profiler-light)
                 TORCH_PROFILER_LIGHT="$2"
+                shift 2
+                ;;
+            --profile-detail)
+                PROFILE_DETAIL="$2"
                 shift 2
                 ;;
             -h|--help)
@@ -133,6 +138,13 @@ validate_args() {
         log_error "--runs 必须是大于 0 的整数，当前值: $RUNS_OVERRIDE"
         exit 1
     fi
+    case "$PROFILE_DETAIL" in
+        light|full_stack) ;;
+        *)
+            log_error "--profile-detail 仅支持 light|full_stack，当前值: $PROFILE_DETAIL"
+            exit 1
+            ;;
+    esac
 }
 
 update_tool_config() {
@@ -180,6 +192,7 @@ update_tool_config() {
     yq -i ".current_run.scenario_type = \"${SCENARIO_TYPE}\"" "$TOOL_CONFIG"
     yq -i ".current_run.torch_profile = true" "$TOOL_CONFIG"
     yq -i ".current_run.torch_profiler_light = ${TORCH_PROFILER_LIGHT}" "$TOOL_CONFIG"
+    yq -i ".current_run.profile_detail = \"${PROFILE_DETAIL}\"" "$TOOL_CONFIG"
     yq -i ".current_run.torch_with_stack = ${TORCH_WITH_STACK}" "$TOOL_CONFIG"
     yq -i ".current_run.torch_record_shapes = ${TORCH_RECORD_SHAPES}" "$TOOL_CONFIG"
     yq -i ".current_run.torch_profile_memory = ${TORCH_PROFILE_MEMORY}" "$TOOL_CONFIG"

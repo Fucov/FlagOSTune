@@ -129,6 +129,39 @@ class SGLangProfileRunnerTest(unittest.TestCase):
         self.assertEqual(env["SGLANG_TORCH_PROFILER_PROFILE_MEMORY"], "0")
         self.assertEqual(env["SGLANG_TORCH_PROFILER_WITH_MODULES"], "0")
 
+    def test_profile_detail_full_stack_enables_stack_shapes_and_modules_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = sample_config(Path(tmp))
+            config["current_run"]["profile_detail"] = "full_stack"
+
+            from scripts.tools.sglang_profile_runner import build_profiler_env
+
+            env = build_profiler_env(config)
+
+        self.assertEqual(env["SGLANG_TORCH_PROFILER_DETAIL"], "full_stack")
+        self.assertEqual(env["SGLANG_TORCH_PROFILER_WITH_STACK"], "1")
+        self.assertEqual(env["SGLANG_TORCH_PROFILER_RECORD_SHAPES"], "1")
+        self.assertEqual(env["SGLANG_TORCH_PROFILER_PROFILE_MEMORY"], "0")
+        self.assertEqual(env["SGLANG_TORCH_PROFILER_WITH_MODULES"], "1")
+
+    def test_profile_detail_rejects_invalid_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = sample_config(Path(tmp))
+            config["current_run"]["profile_detail"] = "huge_trace"
+            from scripts.tools.sglang_profile_runner import build_profiler_env
+
+            with self.assertRaisesRegex(SystemExit, "profile_detail"):
+                build_profiler_env(config)
+
+    def test_workflow_scripts_accept_and_forward_profile_detail(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        auto = (root / "scripts" / "sglang-auto-workflow.sh").read_text(encoding="utf-8")
+        run = (root / "scripts" / "sglang-run-workflow.sh").read_text(encoding="utf-8")
+        self.assertIn("--profile-detail", auto)
+        self.assertIn('args+=("--profile-detail" "$PROFILE_DETAIL")', auto)
+        self.assertIn("--profile-detail", run)
+        self.assertIn(".current_run.profile_detail", run)
+
     def test_profiler_options_can_enable_full_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = sample_config(Path(tmp))

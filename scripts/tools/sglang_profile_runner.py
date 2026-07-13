@@ -109,6 +109,22 @@ def bool_env(value: bool) -> str:
 
 def build_profiler_env(config: Dict[str, Any]) -> Dict[str, str]:
     current_run = config.get("current_run", {}) or {}
+    detail_value = current_run.get("profile_detail")
+    if detail_value is not None:
+        detail = str(detail_value).strip().lower()
+        if detail not in {"light", "full_stack"}:
+            raise SystemExit(
+                f"[ERROR] current_run.profile_detail 仅支持 light|full_stack，当前值: {detail_value}"
+            )
+        full_stack = detail == "full_stack"
+        return {
+            "SGLANG_TORCH_PROFILER_DETAIL": detail,
+            "SGLANG_TORCH_PROFILER_LIGHT": bool_env(not full_stack),
+            "SGLANG_TORCH_PROFILER_WITH_STACK": bool_env(full_stack),
+            "SGLANG_TORCH_PROFILER_RECORD_SHAPES": bool_env(full_stack),
+            "SGLANG_TORCH_PROFILER_PROFILE_MEMORY": "0",
+            "SGLANG_TORCH_PROFILER_WITH_MODULES": bool_env(full_stack),
+        }
     light = bool_value(current_run.get("torch_profiler_light", True))
 
     def flag(name: str, default_when_full: bool = False) -> bool:
@@ -117,6 +133,7 @@ def build_profiler_env(config: Dict[str, Any]) -> Dict[str, str]:
         return bool_value(current_run.get(name, default_when_full))
 
     return {
+        "SGLANG_TORCH_PROFILER_DETAIL": "light" if light else "legacy_custom",
         "SGLANG_TORCH_PROFILER_LIGHT": bool_env(light),
         "SGLANG_TORCH_PROFILER_WITH_STACK": bool_env(flag("torch_with_stack")),
         "SGLANG_TORCH_PROFILER_RECORD_SHAPES": bool_env(flag("torch_record_shapes")),
