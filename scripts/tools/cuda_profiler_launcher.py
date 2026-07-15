@@ -9,7 +9,7 @@ import sys
 from typing import Any, Callable, List, Optional
 
 
-ModuleRunner = Callable[[str, str], Any]
+ModuleRunner = Callable[..., Any]
 
 
 def cuda_call_succeeded(result: object) -> bool:
@@ -50,7 +50,7 @@ def run_module_with_cuda_profiler(
         if not cuda_call_succeeded(start_result):
             raise RuntimeError(f"cudaProfilerStart failed: {start_result}")
         started = True
-        return module_runner(module, "__main__")
+        return module_runner(module, run_name="__main__")
     finally:
         try:
             if started:

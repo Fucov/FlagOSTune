@@ -1,0 +1,297 @@
+import os
+import json
+import subprocess
+import tempfile
+import textwrap
+import unittest
+import uuid
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+WORKFLOW = ROOT / "scripts" / "sglang-nsys-workflow.sh"
+
+
+FAKE_YQ = r'''#!/usr/bin/env python3
+import json
+import re
+import sys
+
+args = sys.argv[1:]
+if args and args[0] == "-r":
+    args.pop(0)
+expression, config_path = args
+with open(config_path, encoding="utf-8") as handle:
+    data = json.load(handle)
+
+def resolve(path):
+    value = data
+    for name, index in re.findall(r"\.([A-Za-z0-9_]+)(?:\[([0-9]+)\])?", path):
+        if not isinstance(value, dict) or name not in value:
+            return None
+        value = value[name]
+        if index:
+            if not isinstance(value, list) or int(index) >= len(value):
+                return None
+            value = value[int(index)]
+    return value
+
+if "| length" in expression:
+    value = resolve(expression.split("|", 1)[0].strip())
+    value = len(value) if isinstance(value, (list, dict, str)) else 0
+else:
+    value = None
+    for part in expression.split(" // "):
+        part = part.strip()
+        if part.startswith("."):
+            candidate = resolve(part)
+        elif part.startswith(('"', "'")):
+            candidate = json.loads(part.replace("'", '"'))
+        elif part == "true":
+            candidate = True
+        elif part == "false":
+            candidate = False
+        elif part == "null":
+            candidate = None
+        else:
+            try:
+                candidate = int(part)
+            except ValueError:
+                candidate = part
+        if candidate is not None:
+            value = candidate
+            break
+
+if isinstance(value, bool):
+    print(str(value).lower())
+elif value is None:
+    print("null")
+elif isinstance(value, (dict, list)):
+    print(json.dumps(value))
+else:
+    print(value)
+'''
+
+
+def make_config(model_name, model_path, tp, scenarios=None):
+    return {
+        "model": {
+            "name": model_name,
+            "path": model_path,
+            "tokenizer_path": None,
+            "tensor_parallel_size": tp,
+        },
+        "serve": {"trust_remote_code": True},
+        "sglang": {
+            "dtype": "bfloat16",
+            "mem_fraction_static": 0.75,
+            "context_length": 4096,
+            "load_format": "auto",
+            "extra_args": "--disable-cuda-graph --sampling-backend pytorch",
+        },
+        "benchmark": {
+            "dataset_name": "random",
+            "dataset_path": "/datasets/local.json",
+            "scenarios": {
+                "optimized": scenarios
+                or [
+                    {
+                        "name": "p128d16_c1",
+                        "input_len": 128,
+                        "output_len": 16,
+                        "concurrency": 1,
+                    }
+                ]
+            },
+        },
+    }
+
+
+class SGLangNsysWorkflowTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.bin_dir = Path(self.temp_dir.name) / "bin"
+        self.bin_dir.mkdir()
+        yq = self.bin_dir / "yq"
+        yq.write_text(FAKE_YQ, encoding="utf-8")
+        yq.chmod(0o755)
+        self.config_paths = []
+
+    def tearDown(self):
+        for path in self.config_paths:
+            path.unlink(missing_ok=True)
+        self.temp_dir.cleanup()
+
+    def write_config(self, config):
+        suffix = f"NsysTest-{uuid.uuid4().hex}"
+        path = ROOT / f"config.yaml.{suffix}"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        self.config_paths.append(path)
+        return suffix
+
+    def run_workflow(self, suffix, *args):
+        env = os.environ.copy()
+        env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
+        return subprocess.run(
+            ["bash", str(WORKFLOW), "--model", suffix, *args],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_qwen_dry_run_has_required_nsys_flags_and_no_torch_profile(self):
+        model_name = "Qwen3.6-35B-A3B-FP8-TP4-Test"
+        suffix = self.write_config(
+            make_config(model_name, "/models/Qwen3.6-35B-A3B-FP8", 4)
+        )
+
+        result = self.run_workflow(
+            suffix,
+            "--nsys",
+            "--dry-run",
+            "--nsys-output",
+            "capture",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--trace=cuda,nvtx,osrt", result.stdout)
+        self.assertIn("--sample=none", result.stdout)
+        self.assertIn("--cpuctxsw=none", result.stdout)
+        self.assertIn("--capture-range=cudaProfilerApi", result.stdout)
+        self.assertNotIn(" --profile ", result.stdout)
+        self.assertNotIn("SGLANG_TORCH_PROFILER", result.stdout)
+        self.assertIn(
+            f"results/{model_name}/nsys/capture.nsys-rep",
+            result.stdout,
+        )
+        self.assertIn("--random-input-len 128", result.stdout)
+        self.assertIn("--random-output-len 16", result.stdout)
+        self.assertIn("--tp-size 4", result.stdout)
+
+    def test_deepseek_tp8_is_supported(self):
+        model_name = "DeepSeek-V4-Flash-FP8-TP8-Test"
+        suffix = self.write_config(
+            make_config(model_name, "/models/DeepSeek-V4-Flash-FP8", 8)
+        )
+
+        result = self.run_workflow(suffix, "--nsys", "--dry-run")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--tp-size 8", result.stdout)
+        self.assertIn(f"results/{model_name}/nsys/", result.stdout)
+        self.assertIn("p128d16_c1", result.stdout)
+
+    def test_deepseek_tp_mismatch_is_rejected(self):
+        suffix = self.write_config(
+            make_config(
+                "DeepSeek-V4-Flash-FP8-TP8-Test",
+                "/models/DeepSeek-V4-Flash-FP8",
+                4,
+            )
+        )
+
+        result = self.run_workflow(suffix, "--nsys", "--dry-run")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TP8", result.stderr)
+
+    def test_nsys_flag_is_required(self):
+        suffix = self.write_config(
+            make_config(
+                "Qwen3.6-35B-A3B-FP8-TP4-Test",
+                "/models/Qwen3.6-35B-A3B-FP8",
+                4,
+            )
+        )
+
+        result = self.run_workflow(suffix, "--dry-run")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--nsys", result.stderr)
+
+    def test_multiple_scenarios_append_names_to_explicit_prefix(self):
+        scenarios = [
+            {"name": "prefill", "input_len": 128, "output_len": 1, "concurrency": 1},
+            {"name": "decode", "input_len": 32, "output_len": 16, "concurrency": 2},
+        ]
+        model_name = "Qwen3.6-35B-A3B-FP8-TP4-Multi"
+        suffix = self.write_config(
+            make_config(
+                model_name,
+                "/models/Qwen3.6-35B-A3B-FP8",
+                4,
+                scenarios,
+            )
+        )
+
+        result = self.run_workflow(
+            suffix,
+            "--nsys",
+            "--dry-run",
+            "--nsys-output",
+            "custom/report.nsys-rep",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("custom/report-prefill.nsys-rep", result.stdout)
+        self.assertIn("custom/report-decode.nsys-rep", result.stdout)
+        self.assertNotIn(".nsys-rep-prefill", result.stdout)
+
+    def test_missing_scenario_group_is_rejected(self):
+        suffix = self.write_config(
+            make_config(
+                "Qwen3.6-35B-A3B-FP8-TP4-Test",
+                "/models/Qwen3.6-35B-A3B-FP8",
+                4,
+            )
+        )
+
+        result = self.run_workflow(
+            suffix,
+            "--nsys",
+            "--dry-run",
+            "--scenario",
+            "full",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("full", result.stderr)
+
+    def test_unsupported_model_is_rejected(self):
+        suffix = self.write_config(make_config("OtherModel", "/models/other", 4))
+
+        result = self.run_workflow(suffix, "--nsys", "--dry-run")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("不支持", result.stderr)
+
+    def test_torch_profile_flag_in_extra_args_is_rejected(self):
+        config = make_config(
+            "Qwen3.6-35B-A3B-FP8-TP4-Test",
+            "/models/Qwen3.6-35B-A3B-FP8",
+            4,
+        )
+        config["sglang"]["extra_args"] = "--profile --disable-cuda-graph"
+        suffix = self.write_config(config)
+
+        result = self.run_workflow(suffix, "--nsys", "--dry-run")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--profile", result.stderr)
+        self.assertIn("Torch Profiler", result.stderr)
+
+    def test_help_does_not_require_dependencies_or_model(self):
+        result = subprocess.run(
+            ["bash", str(WORKFLOW), "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--nsys-output", result.stdout)
+        self.assertIn("--scenario", result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()

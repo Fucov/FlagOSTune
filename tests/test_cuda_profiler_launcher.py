@@ -24,7 +24,7 @@ class CudaProfilerLauncherTest(unittest.TestCase):
         cudart = FakeCudart()
         seen = []
 
-        def module_runner(module, run_name):
+        def module_runner(module, *, run_name):
             seen.append((module, run_name, list(sys.argv)))
 
         run_module_with_cuda_profiler(
@@ -54,7 +54,8 @@ class CudaProfilerLauncherTest(unittest.TestCase):
         cudart = FakeCudart()
         original_argv = list(sys.argv)
 
-        def fail(_module, _run_name):
+        def fail(_module, *, run_name):
+            self.assertEqual(run_name, "__main__")
             raise RuntimeError("boom")
 
         with self.assertRaisesRegex(RuntimeError, "boom"):
@@ -84,7 +85,9 @@ class CudaProfilerLauncherTest(unittest.TestCase):
                 "target",
                 [],
                 cudart=cudart,
-                module_runner=lambda _module, _run_name: None,
+                module_runner=lambda _module, *, run_name: self.assertEqual(
+                    run_name, "__main__"
+                ),
             )
 
         self.assertEqual(cudart.calls, ["start", "stop"])
