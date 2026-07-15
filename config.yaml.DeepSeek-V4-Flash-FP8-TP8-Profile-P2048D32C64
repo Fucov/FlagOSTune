@@ -1,0 +1,33 @@
+model:
+  name: DeepSeek-V4-Flash-FP8-TP8-Profile-P2048D32C64
+  path: /data/models/DeepSeek-V4-Flash-FP8
+  tokenizer_path: /data/models/DeepSeek-V4-Flash-FP8
+  tensor_parallel_size: 8
+runtime:
+  backend: sglang
+  device: cuda
+  dtype: bfloat16
+sglang:
+  context_length: 8192
+  mem_fraction_static: 0.75
+  load_format: safetensors
+  trust_remote_code: true
+  extra_args: --skip-server-warmup --skip-warmup --max-total-tokens 524288 --max-running-requests
+    64 --swa-full-tokens-ratio 0.3 --chunked-prefill-size 8192 --max-prefill-tokens
+    8192 --disable-radix-cache --disable-chunked-prefix-cache --disable-overlap-schedule
+    --cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled --random-range-ratio
+    1.0 --sampling-backend pytorch --dist-timeout 1800 --watchdog-timeout 3600 --port
+    30001 --nccl-port 29501
+benchmark:
+  dataset_name: random
+  dataset_path: /data/yangkw/datasets/sharegpt_synthetic_2048.json
+  num_runs: 2
+  scenarios:
+    optimized:
+    - name: p2048d32_c64
+      input_len: 2048
+      output_len: 32
+      concurrency: 64
+output:
+  result_dir: /data/yangkw/outputs/flagostune_results
+  report_dir: /data/yangkw/outputs/flagostune_reports

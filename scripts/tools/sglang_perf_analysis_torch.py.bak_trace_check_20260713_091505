@@ -1400,36 +1400,14 @@ def validate_report_metadata(
         raise _metadata_error("report scenario does not match run_metadata.json")
 
     metadata_traces = _metadata_nested(metadata, "trace", "trace_files") or []
-
-    # Support multiple run_metadata schemas:
-    # 1) trace_files: ["...trace.json.gz", ...]
-    # 2) trace_files: [{"path": "...trace.json.gz"}, ...]
-    # 3) trace_files: {"value": ["...trace.json.gz", ...], "source": "..."}
-    if isinstance(metadata_traces, dict) and "value" in metadata_traces:
-        metadata_traces = metadata_traces.get("value") or []
-
-    recorded_paths = set()
-    for item in metadata_traces:
-        if isinstance(item, str):
-            if item:
-                recorded_paths.add(str(Path(item).resolve()))
-        elif isinstance(item, dict):
-            candidate = item.get("path") or item.get("value") or item.get("file") or item.get("trace")
-            if candidate:
-                recorded_paths.add(str(Path(candidate).resolve()))
-
-    selected_paths = {str(path.resolve()) for path in trace_files}
-
-    missing_selected = selected_paths - recorded_paths
-    if missing_selected:
-        print("[DEBUG] selected trace paths:")
-        for path in sorted(selected_paths):
-            print("  selected:", path)
-        print("[DEBUG] recorded trace paths from run_metadata:")
-        for path in sorted(recorded_paths):
-            print("  recorded:", path)
-        print("[DEBUG] raw metadata trace_files:", metadata_traces)
-        raise _metadata_error("selected trace path is not recorded in run_metadata.json")
+    recorded_paths = {
+        str(Path(item.get("path", "")).resolve())
+        for item in metadata_traces
+        if isinstance(item, dict) and item.get("path")
+    }
+    for trace_path in trace_files:
+        if str(trace_path.resolve()) not in recorded_paths:
+            raise _metadata_error("selected trace path is not recorded in run_metadata.json")
 
     return {
         "model_name": expected_model,
