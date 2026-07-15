@@ -196,6 +196,67 @@ python scripts/tools/perf_summary_torch.py
 - CUDA / FlagGems 对比表
 - 按 `rank` 维度的 profiler 统计
 
+### 3.3 SGLang Nsight Systems Profiling
+
+SGLang Nsight Systems 使用独立入口，不会启用或修改已有 Torch Profiler
+workflow。运行环境需要安装 `nsys`、`yq` v4、带 CUDA 的 PyTorch 和 SGLang。
+
+建议先用 `--dry-run` 校验模型、TP 大小、场景和最终命令。dry-run 不要求本机
+安装 `nsys` 或加载模型：
+
+```bash
+./scripts/sglang-nsys-workflow.sh \
+  --model Qwen3.6-35B-A3B-FP8-TP4-P128D16 \
+  --nsys \
+  --dry-run
+
+./scripts/sglang-nsys-workflow.sh \
+  --model DeepSeek-V4-Flash-FP8-TP8-Profile-P2048D32C64 \
+  --nsys \
+  --dry-run
+```
+
+采集 Qwen TP4 和 DeepSeek TP8：
+
+```bash
+./scripts/sglang-nsys-workflow.sh \
+  --model Qwen3.6-35B-A3B-FP8-TP4-P128D16 \
+  --nsys \
+  --nsys-output qwen-tp4-profile
+
+./scripts/sglang-nsys-workflow.sh \
+  --model DeepSeek-V4-Flash-FP8-TP8-Profile-P2048D32C64 \
+  --nsys \
+  --nsys-output deepseek-tp8-profile
+```
+
+裸文件名形式的 `--nsys-output` 会写入模型默认目录：
+
+```text
+results/Qwen3.6-35B-A3B-FP8-TP4-P128D16/nsys/qwen-tp4-profile.nsys-rep
+results/DeepSeek-V4-Flash-FP8-TP8-Profile-P2048D32C64/nsys/deepseek-tp8-profile.nsys-rep
+```
+
+也可以传入相对或绝对路径。相对路径以仓库根目录为基准；可选的
+`.nsys-rep` 后缀会自动移除后再交给 `nsys`。如果所选场景组包含多个场景，
+脚本会给显式前缀追加场景名，每个场景生成一个独立报告。
+
+解析报告：
+
+```bash
+python3 scripts/tools/parse_nsys.py \
+  results/Qwen3.6-35B-A3B-FP8-TP4-P128D16/nsys/qwen-tp4-profile.nsys-rep \
+  --top 20
+
+python3 scripts/tools/parse_nsys.py \
+  results/DeepSeek-V4-Flash-FP8-TP8-Profile-P2048D32C64/nsys/deepseek-tp8-profile.nsys-rep \
+  --top 20
+```
+
+解析器分别输出 Top CUDA Kernels（含 kernel time percentage）、NVTX Range
+Summary 和 CUDA API Summary。可用 `--nsys /path/to/nsys` 指定非默认的
+Nsight Systems 可执行文件。
+
 ---
 
 ## 4. Gems shape 导出
