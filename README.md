@@ -198,64 +198,104 @@ python scripts/tools/perf_summary_torch.py
 
 ### 3.3 SGLang Nsight Systems Profiling
 
-SGLang Nsight Systems 使用独立入口，不会启用或修改已有 Torch Profiler
-workflow。运行环境需要安装 `nsys`、`yq` v4、带 CUDA 的 PyTorch 和 SGLang。
+该入口独立于已有 Torch Profiler workflow；两者不能同时启用。运行服务器需
+安装 `nsys`、`yq` v4、带 CUDA 的 PyTorch 和 SGLang。本地无 GPU/NSys 时可先
+追加 `--dry-run`，检查模型配置、设备、TP、输出路径和完整命令。
 
-建议先用 `--dry-run` 校验模型、TP 大小、场景和最终命令。dry-run 不要求本机
-安装 `nsys` 或加载模型：
+Qwen TP4 一次完成 full-offline 采集、SQLite 导出、依赖/通信分析和 Markdown：
 
 ```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
 ./scripts/sglang-nsys-workflow.sh \
   --model Qwen3.6-35B-A3B-FP8-TP4-P128D16 \
   --nsys \
-  --dry-run
+  --capture-mode full-offline \
+  --nsys-output qwen-tp4-full \
+  --parse \
+  --parse-top 20 \
+  --parse-output-dir results/Qwen3.6-35B-A3B-FP8-TP4-P128D16/nsys/qwen-tp4-full-summary \
+  --analyze-dependencies \
+  --analyze-communication \
+  --dependency-trace
+```
 
+DeepSeek TP8：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 ./scripts/sglang-nsys-workflow.sh \
   --model DeepSeek-V4-Flash-FP8-TP8-Profile-P2048D32C64 \
   --nsys \
-  --dry-run
+  --capture-mode full-offline \
+  --nsys-output deepseek-tp8-full \
+  --parse \
+  --parse-top 20 \
+  --parse-output-dir results/DeepSeek-V4-Flash-FP8-TP8-Profile-P2048D32C64/nsys/deepseek-tp8-full-summary \
+  --analyze-dependencies \
+  --analyze-communication \
+  --dependency-trace
 ```
 
-采集 Qwen TP4 和 DeepSeek TP8：
+`--dependency-trace` 会增加较昂贵的 CUDA event tracing，仅在需要事件级分析时
+启用。只需要 Top Kernel/NVTX/CUDA API/多卡汇总时可删除最后三项分析参数。
+采集命令固定包含 `--trace-fork-before-exec=true` 和
+`--capture-range-end=stop`。输出包括 `.nsys-rep`、`.nsys.log`、相邻的
+`.metadata.json` 和指定 summary 目录内的 `nsys_analysis.md`。
 
-```bash
-./scripts/sglang-nsys-workflow.sh \
-  --model Qwen3.6-35B-A3B-FP8-TP4-P128D16 \
-  --nsys \
-  --nsys-output qwen-tp4-profile
+短 prefill/decode 工作负载仍使用 full-offline 采集。例如可分别选择
+`DeepSeek-V4-Flash-FP8-TP8-Profile-P32768D1C1`（prefill-dominant）和
+`Qwen3.6-35B-A3B-FP8-TP4-P128D16`（含短 decode）配置，再使用上述命令。
+prefill/decode 标签仅依据 NVTX、日志或 metadata 做辅助归因；full-run trace
+不能直接称为 decode-only trace。独立 `server-steps` capture mode 当前明确
+deferred，脚本不会静默接受未实现的模式。
 
-./scripts/sglang-nsys-workflow.sh \
-  --model DeepSeek-V4-Flash-FP8-TP8-Profile-P2048D32C64 \
-  --nsys \
-  --nsys-output deepseek-tp8-profile
-```
-
-裸文件名形式的 `--nsys-output` 会写入模型默认目录：
-
-```text
-results/Qwen3.6-35B-A3B-FP8-TP4-P128D16/nsys/qwen-tp4-profile.nsys-rep
-results/DeepSeek-V4-Flash-FP8-TP8-Profile-P2048D32C64/nsys/deepseek-tp8-profile.nsys-rep
-```
-
-也可以传入相对或绝对路径。相对路径以仓库根目录为基准；可选的
-`.nsys-rep` 后缀会自动移除后再交给 `nsys`。如果所选场景组包含多个场景，
-脚本会给显式前缀追加场景名，每个场景生成一个独立报告。
-
-解析报告：
+单独解析已有报告（进度写 stderr，Markdown 写 stdout，因此 `tee` 可用）：
 
 ```bash
 python3 scripts/tools/parse_nsys.py \
-  results/Qwen3.6-35B-A3B-FP8-TP4-P128D16/nsys/qwen-tp4-profile.nsys-rep \
-  --top 20
-
-python3 scripts/tools/parse_nsys.py \
-  results/DeepSeek-V4-Flash-FP8-TP8-Profile-P2048D32C64/nsys/deepseek-tp8-profile.nsys-rep \
-  --top 20
+  results/Qwen3.6-35B-A3B-FP8-TP4-P128D16/nsys/qwen-tp4-full.nsys-rep \
+  --output-dir results/Qwen3.6-35B-A3B-FP8-TP4-P128D16/nsys/qwen-tp4-full-summary \
+  --top 20 \
+  --analyze-dependencies \
+  --analyze-communication \
+  | tee qwen-nsys-summary.txt
 ```
 
-解析器分别输出 Top CUDA Kernels（含 kernel time percentage）、NVTX Range
-Summary 和 CUDA API Summary。可用 `--nsys /path/to/nsys` 指定非默认的
-Nsight Systems 可执行文件。
+默认会复用 mtime 不早于 `.nsys-rep` 的相邻 SQLite。强制重新导出或禁用缓存：
+
+```bash
+python3 scripts/tools/parse_nsys.py REPORT.nsys-rep --force-export
+python3 scripts/tools/parse_nsys.py REPORT.nsys-rep --no-reuse-sqlite
+python3 scripts/tools/parse_nsys.py REPORT.sqlite --reports cuda_gpu_kern_sum,cuda_api_sum,nvtx_sum
+```
+
+大型 TP4/TP8 报告解析时可在另一个终端监控真实进度：
+
+```bash
+watch -n 5 'ls -lh REPORT.nsys-rep REPORT.sqlite SUMMARY/*.csv 2>/dev/null'
+tail -f SUMMARY/progress.log SUMMARY/export_sqlite.log
+ps -ef | grep -E '[p]arse_nsys|[n]sys (export|stats)'
+```
+
+summary 主要文件含义：
+
+| 文件 | 含义 |
+| --- | --- |
+| `metadata.json` | 输入、SQLite、NSys 版本、模型/TP/设备、report 状态和 warning |
+| `progress.log` / `export_sqlite.log` | 阶段、命令、heartbeat、导出 stderr |
+| `cuda_gpu_kern_sum.csv` / `cuda_gpu_kern_sum_base.csv` | 完整 kernel 与 base family 汇总 |
+| `cuda_gpu_kern_gb_sum.csv` | kernel grid/block 启动形状汇总 |
+| `cuda_api_sum.csv` / `cuda_kern_exec_sum_base.csv` | CUDA API 与 launch/queue/kernel 时间 |
+| `nvtx_sum.csv` / `nvtx_gpu_proj_sum.csv` | NVTX range 与 GPU projection |
+| `cuda_gpu_mem_time_sum.csv` / `cuda_gpu_mem_size_sum.csv` | GPU memory 操作时间和大小 |
+| `cuda_gpu_trace_base.csv` / `cuda_kern_exec_trace_base.csv` | 可选事件级 trace 数据 |
+| `nvtx_kern_sum_base.csv` / `nvtx_gpu_proj_trace.csv` | 可选 NVTX-kernel/投影 trace |
+| `kernel_classification.csv` / `unknown_kernels.csv` | 规则分类和未识别 kernel |
+| `device_summary.csv` | 每张 GPU 的事件数、累计时间、计算/通信和不均衡 |
+| `kernel_adjacency.csv` | same-stream 时序邻接；不代表 Tensor 数据依赖 |
+| `communication_events.csv` | 通信 overlap 与派生 exposed 时间 |
+| `communication_chains.csv` / `fusion_candidates.csv` | 通信-计算链和透明启发式候选 |
+| `nsys_analysis.md` | 固定 16 节最终分析报告 |
 
 ---
 
