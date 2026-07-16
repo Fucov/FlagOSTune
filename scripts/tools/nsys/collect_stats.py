@@ -36,6 +36,12 @@ TRACE_REPORTS = (
 KNOWN_REPORTS = BASE_REPORTS + TRACE_REPORTS
 
 
+def parse_help_report_names(text: str) -> Set[str]:
+    """Extract concrete report names while ignoring help grammar suffixes."""
+    pattern = r"\b((?:cuda|nvtx)_[a-z0-9_]+(?::(?:base|mangled))?)(?=\[|\s|,|$)"
+    return {match.lower() for match in re.findall(pattern, text, re.IGNORECASE)}
+
+
 def report_filename(report_name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", report_name).replace(":", "_") + ".csv"
 
@@ -61,23 +67,44 @@ def detect_supported_reports(
     help_path = output_dir / ".help-reports.txt"
     started = progress.begin("Detect supported reports", command=command, output_path=help_path)
     code = run_streaming_command(
-        command, help_path, output_dir / "progress.log", progress, monitored_output=help_path
+        command,
+        help_path,
+        output_dir / "progress.log",
+        progress,
+        monitored_output=help_path,
+        merge_stderr=True,
     )
-    if code != 0:
+    text = help_path.read_text(encoding="utf-8", errors="replace")
+    supported = parse_help_report_names(text)
+    degraded_help_is_valid = (
+        "The following built-in reports are available:" in text
+        and CORE_REPORT in supported
+        and "cuda_api_sum" in supported
+    )
+    if code != 0 and not degraded_help_is_valid:
         progress.finish("Detect supported reports", started, "FAILED", output_path=help_path)
         help_path.unlink(missing_ok=True)
-        raise CoreReportError(f"nsys stats --help-reports failed with exit {code}")
-    text = help_path.read_text(encoding="utf-8", errors="replace")
-    supported = {name for name in KNOWN_REPORTS if name in text}
-    for token in re.findall(r"[A-Za-z][A-Za-z0-9_]*(?::[A-Za-z0-9_]+)?", text):
-        if token.startswith(("cuda_", "nvtx_")):
-            supported.add(token)
+        raise CoreReportError(
+            f"nsys stats --help-reports failed with exit {code} and no valid help body"
+        )
     help_path.unlink(missing_ok=True)
-    progress.finish(
-        "Detect supported reports", started, detail=f"supported={len(supported)}"
-    )
     if CORE_REPORT not in supported:
+        progress.finish(
+            "Detect supported reports", started, "FAILED", detail="core report missing"
+        )
         raise CoreReportError(f"installed Nsight does not support core report {CORE_REPORT}")
+    if code != 0:
+        message = (
+            f"nsys stats --help-reports returned exit {code}, but its help body is valid; continuing"
+        )
+        progress.finish(
+            "Detect supported reports", started, "WARNING", detail=f"supported={len(supported)}"
+        )
+        progress.warning(message)
+    else:
+        progress.finish(
+            "Detect supported reports", started, detail=f"supported={len(supported)}"
+        )
     return supported
 
 

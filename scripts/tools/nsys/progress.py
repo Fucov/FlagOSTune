@@ -82,6 +82,7 @@ def run_streaming_command(
     heartbeat_seconds: float = 10.0,
     monitored_output: Optional[Path] = None,
     popen_factory=subprocess.Popen,
+    merge_stderr: bool = False,
 ) -> int:
     """Run a child while forwarding stderr and reporting output growth."""
     stderr_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,7 +97,7 @@ def run_streaming_command(
             process = popen_factory(
                 [str(value) for value in command],
                 stdout=stdout_handle if stdout_handle is not None else subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
                 bufsize=0,
             )
         except FileNotFoundError as exc:
@@ -111,8 +112,10 @@ def run_streaming_command(
                     log.flush()
                     progress.emit(raw.decode("utf-8", errors="replace").rstrip("\n"))
 
-        reader = threading.Thread(target=forward_stderr, daemon=True)
-        reader.start()
+        reader = None
+        if not merge_stderr:
+            reader = threading.Thread(target=forward_stderr, daemon=True)
+            reader.start()
         interval = max(0.01, heartbeat_seconds)
         while True:
             try:
@@ -124,7 +127,8 @@ def run_streaming_command(
                 progress.emit(
                     f"  heartbeat | elapsed={elapsed:.1f}s | output={format_bytes(size)}"
                 )
-        reader.join(timeout=2.0)
+        if reader is not None:
+            reader.join(timeout=2.0)
         if process.stderr is not None:
             process.stderr.close()
         return int(return_code)

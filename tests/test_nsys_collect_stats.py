@@ -9,6 +9,7 @@ from scripts.tools.nsys.collect_stats import (
     CoreReportError,
     collect_reports,
     detect_supported_reports,
+    parse_help_report_names,
     report_filename,
     select_reports,
 )
@@ -21,8 +22,15 @@ args = sys.argv[1:]
 with open(os.environ['FAKE_NSYS_CALLS'], 'a', encoding='utf-8') as handle:
     handle.write(' '.join(args) + '\\n')
 if '--help-reports' in args:
-    print('cuda_gpu_kern_sum cuda_gpu_kern_sum:base cuda_api_sum nvtx_sum')
-    raise SystemExit(0)
+    text = os.environ.get(
+        'FAKE_NSYS_HELP_TEXT',
+        'The following built-in reports are available:\\n'
+        'cuda_gpu_kern_sum cuda_gpu_kern_sum:base cuda_api_sum nvtx_sum',
+    )
+    stream = sys.stderr if os.environ.get('FAKE_NSYS_HELP_STREAM') == 'stderr' else sys.stdout
+    if text:
+        print(text, file=stream, flush=True)
+    raise SystemExit(int(os.environ.get('FAKE_NSYS_HELP_EXIT', '0')))
 report = args[args.index('--report') + 1]
 if report == os.environ.get('FAKE_NSYS_FAIL'):
     print('missing table', file=sys.stderr, flush=True)
@@ -67,6 +75,44 @@ class NsysCollectStatsTest(unittest.TestCase):
         calls = self.calls.read_text()
         self.assertIn("stats --help-reports", calls)
         self.assertNotIn("force-export", calls)
+
+    def test_nonzero_exit_with_valid_help_is_accepted_with_warning(self):
+        os.environ["FAKE_NSYS_HELP_EXIT"] = "1"
+
+        supported = detect_supported_reports(str(self.nsys), self.summary, self.progress)
+
+        self.assertIn("cuda_gpu_kern_sum", supported)
+        self.assertIn("cuda_api_sum", supported)
+        self.assertIn("WARNING", self.stderr.getvalue())
+        self.assertIn("exit 1", self.stderr.getvalue())
+
+    def test_nonzero_exit_with_empty_help_is_rejected(self):
+        os.environ["FAKE_NSYS_HELP_EXIT"] = "1"
+        os.environ["FAKE_NSYS_HELP_TEXT"] = ""
+
+        with self.assertRaisesRegex(CoreReportError, "help-reports"):
+            detect_supported_reports(str(self.nsys), self.summary, self.progress)
+
+    def test_valid_help_written_to_stderr_is_accepted(self):
+        os.environ["FAKE_NSYS_HELP_EXIT"] = "1"
+        os.environ["FAKE_NSYS_HELP_STREAM"] = "stderr"
+
+        supported = detect_supported_reports(str(self.nsys), self.summary, self.progress)
+
+        self.assertIn("cuda_gpu_kern_sum", supported)
+        self.assertIn("cuda_api_sum", supported)
+
+    def test_optional_help_grammar_parses_base_report_name(self):
+        supported = parse_help_report_names(
+            "The following built-in reports are available:\n"
+            "nvtx_sum[:nvtx-name][:base|:mangled]\n"
+            "cuda_gpu_kern_sum:base\n"
+        )
+
+        self.assertIn("nvtx_sum", supported)
+        self.assertIn("cuda_gpu_kern_sum:base", supported)
+        self.assertNotIn("nvtx-name", supported)
+        self.assertNotIn("mangled", supported)
 
     def test_collects_each_report_from_sqlite_and_persists_csv(self):
         result = collect_reports(
