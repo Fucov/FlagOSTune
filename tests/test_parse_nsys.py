@@ -76,7 +76,7 @@ class ParseNsysTest(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0, stdout=CUDA_CSV, stderr="")
 
         output = run_nsys_report(
-            Path("capture.nsys-rep"),
+            Path("capture.sqlite"),
             "cuda_gpu_kern_sum",
             nsys="/opt/nsys",
             runner=runner,
@@ -92,8 +92,7 @@ class ParseNsysTest(unittest.TestCase):
                 "cuda_gpu_kern_sum",
                 "--format",
                 "csv",
-                "--force-export=true",
-                "capture.nsys-rep",
+                "capture.sqlite",
             ],
         )
         self.assertEqual(seen[0][1], {"capture_output": True, "text": True})
@@ -118,13 +117,20 @@ class ParseNsysTest(unittest.TestCase):
             report.touch()
             fake_nsys = Path(tmp) / "nsys"
             fake_nsys.write_text(
-                "#!/bin/sh\n"
-                "case \"$*\" in\n"
-                "  *nvtx_sum*) name=Range ;;\n"
-                "  *) name=Name ;;\n"
-                "esac\n"
-                "printf 'Time (%%),Total Time (ns),Instances,Avg (ns),%s\\n' \"$name\"\n"
-                "printf '100,1000,1,1000,item\\n'\n",
+                "#!/usr/bin/env python3\n"
+                "import sqlite3,sys\n"
+                "a=sys.argv[1:]\n"
+                "if a[0]=='--version': print('Nsight Systems 2026.1'); raise SystemExit\n"
+                "if a[0]=='export':\n"
+                " p=a[a.index('--output')+1]; c=sqlite3.connect(p); "
+                "c.execute('create table CUPTI_ACTIVITY_KIND_KERNEL (deviceId integer, globalPid integer, start integer, end integer, name text)'); "
+                "c.commit(); c.close(); raise SystemExit\n"
+                "if '--help-reports' in a:\n"
+                " print('cuda_gpu_kern_sum cuda_gpu_kern_sum:base cuda_gpu_kern_gb_sum cuda_kern_exec_sum:base cuda_api_sum nvtx_sum nvtx_gpu_proj_sum cuda_gpu_mem_time_sum cuda_gpu_mem_size_sum'); raise SystemExit\n"
+                "r=a[a.index('--report')+1]\n"
+                "name='Range' if r=='nvtx_sum' else 'Name'\n"
+                "print(f'Time (%),Total Time (ns),Instances,Avg (ns),{name}')\n"
+                "print('100,1000,1,1000,item')\n",
                 encoding="utf-8",
             )
             fake_nsys.chmod(0o755)
@@ -145,10 +151,11 @@ class ParseNsysTest(unittest.TestCase):
             )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Top CUDA Kernels", result.stdout)
-        self.assertIn("NVTX Range Summary", result.stdout)
-        self.assertIn("CUDA API Summary", result.stdout)
+        self.assertIn("Top Kernel Variants", result.stdout)
+        self.assertIn("NVTX and Module Attribution", result.stdout)
+        self.assertIn("CUDA API and Launch/Execution", result.stdout)
         self.assertIn("100.00", result.stdout)
+        self.assertIn("[1/", result.stderr)
 
 
 if __name__ == "__main__":
