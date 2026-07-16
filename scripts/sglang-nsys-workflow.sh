@@ -13,6 +13,14 @@ SCENARIO_TYPE="optimized"
 NSYS_PROFILE=false
 NSYS_OUTPUT=""
 DRY_RUN=false
+PARSE_REPORT=false
+PARSE_TOP=20
+PARSE_OUTPUT_DIR=""
+FORCE_PARSE_EXPORT=false
+ANALYZE_DEPENDENCIES=false
+ANALYZE_COMMUNICATION=false
+DEPENDENCY_TRACE=false
+CAPTURE_MODE="full-offline"
 
 log_info() { printf '[INFO] %s\n' "$1"; }
 log_error() { printf '[ERROR] %s\n' "$1" >&2; }
@@ -27,6 +35,14 @@ usage() {
   --nsys                启用独立 Nsight Systems profiling（必需）
   --nsys-output PREFIX  输出文件名前缀或路径，可带 .nsys-rep 后缀
   --scenario TYPE       optimized|full|shape，默认 optimized
+  --capture-mode MODE   full-offline（server-steps 尚未实现）
+  --parse               采集成功后自动运行 parse_nsys.py
+  --parse-top N         Markdown 表格行数，默认 20
+  --parse-output-dir D  parser 输出目录，默认报告旁的 summary/
+  --force-parse-export  强制 parser 重新导出 SQLite
+  --analyze-dependencies 生成 same-stream 时序邻接分析（需要 trace report）
+  --analyze-communication 生成通信 overlap/chain/fusion 候选分析
+  --dependency-trace    启用昂贵的 --cuda-event-trace=true，默认关闭
   --dry-run             校验配置并打印命令，不执行 nsys/SGLang
   -h, --help            显示帮助
 
@@ -65,6 +81,45 @@ parse_args() {
                 require_value "$1" "${2-}"
                 NSYS_OUTPUT="$2"
                 shift 2
+                ;;
+            --capture-mode)
+                require_value "$1" "${2-}"
+                CAPTURE_MODE="$2"
+                shift 2
+                ;;
+            --parse)
+                PARSE_REPORT=true
+                shift
+                ;;
+            --parse-top)
+                require_value "$1" "${2-}"
+                PARSE_TOP="$2"
+                shift 2
+                ;;
+            --parse-output-dir)
+                require_value "$1" "${2-}"
+                PARSE_OUTPUT_DIR="$2"
+                shift 2
+                ;;
+            --force-parse-export)
+                FORCE_PARSE_EXPORT=true
+                shift
+                ;;
+            --analyze-dependencies)
+                ANALYZE_DEPENDENCIES=true
+                shift
+                ;;
+            --analyze-communication)
+                ANALYZE_COMMUNICATION=true
+                shift
+                ;;
+            --dependency-trace)
+                DEPENDENCY_TRACE=true
+                shift
+                ;;
+            --profile|--torch-profile|--torch-profiler)
+                log_error "Nsight Systems workflow 不能同时开启 Torch Profiler（收到 $1）"
+                exit 2
                 ;;
             --dry-run)
                 DRY_RUN=true
@@ -147,8 +202,10 @@ split_extra_args() {
 }
 
 print_command() {
+    local label="$1"
+    shift
     local item
-    printf '[DRY-RUN] '
+    printf '%s ' "$label"
     for item in "$@"; do
         if [[ "$item" =~ ^[A-Za-z0-9_./:=,@+-]+$ ]]; then
             printf '%s ' "$item"
@@ -157,6 +214,82 @@ print_command() {
         fi
     done
     printf '\n'
+}
+
+build_parse_command() {
+    local report_path="$1"
+    parse_cmd=(
+        "$PYTHON_EXECUTABLE" "${SCRIPT_DIR}/tools/parse_nsys.py"
+        "$report_path" --top "$PARSE_TOP"
+    )
+    if [[ -n "$PARSE_OUTPUT_DIR" ]]; then
+        parse_cmd+=(--output-dir "$PARSE_OUTPUT_DIR")
+    fi
+    if [[ "$FORCE_PARSE_EXPORT" == "true" ]]; then
+        parse_cmd+=(--force-export)
+    fi
+    if [[ "$ANALYZE_DEPENDENCIES" == "true" ]]; then
+        parse_cmd+=(--analyze-dependencies)
+    fi
+    if [[ "$ANALYZE_COMMUNICATION" == "true" ]]; then
+        parse_cmd+=(--analyze-communication)
+    fi
+}
+
+write_capture_metadata() {
+    local metadata_path="$1"
+    local report_path="$2"
+    local model_name="$3"
+    local model_path="$4"
+    local scenario_name="$5"
+    local dataset_name="$6"
+    local tensor_parallel="$7"
+    local output_prefix="$8"
+    local nsys_log="$9"
+    shift 9
+    local visible_devices="${CUDA_VISIBLE_DEVICES:-}"
+    local git_commit
+    git_commit=$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || true)
+    "$PYTHON_EXECUTABLE" - \
+        "$metadata_path" "$report_path" "$model_name" "$model_path" \
+        "$scenario_name" "$dataset_name" "$tensor_parallel" "$visible_devices" \
+        "$CONFIG_FILE" "$output_prefix" "$nsys_log" "$CAPTURE_MODE" "full" \
+        "$git_commit" "$@" <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+(
+    metadata_path, report_path, model_name, model_path, scenario, workload,
+    tp_size, visible_devices, config_path, output_prefix, nsys_log,
+    capture_mode, profile_phase, git_commit,
+) = sys.argv[1:15]
+value = {
+    "input_report": report_path,
+    "model": model_name,
+    "model_path": model_path,
+    "scenario": scenario,
+    "workload": workload,
+    "tp_size": int(tp_size),
+    "visible_devices": visible_devices or None,
+    "config_path": config_path,
+    "output_prefix": output_prefix,
+    "nsys_log": nsys_log,
+    "capture_mode": capture_mode,
+    "profile_phase": profile_phase,
+    "git_commit": git_commit or None,
+    "command": sys.argv[15:],
+    "generated_time": datetime.now(timezone.utc).astimezone().isoformat(),
+}
+temporary = metadata_path + ".tmp"
+with open(temporary, "w", encoding="utf-8") as handle:
+    json.dump(value, handle, ensure_ascii=False, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(temporary, metadata_path)
+PY
 }
 
 validate_model_family() {
@@ -228,7 +361,7 @@ run_scenario() {
     local load_format="${15}"
     local extra_args="${16}"
     local base scenario_name input_len output_len num_prompts
-    local output_prefix expected_report
+    local output_prefix expected_report nsys_log metadata_path report_size nsys_status
 
     base=".benchmark.scenarios.${SCENARIO_TYPE}[${index}]"
     scenario_name=$(yq_read "${base}.name // \"scenario-$((index + 1))\"")
@@ -274,29 +407,65 @@ run_scenario() {
     expected_report="${output_prefix}.nsys-rep"
     cmd=(
         nsys profile
+        --trace-fork-before-exec=true
         --trace=cuda,nvtx,osrt
         --sample=none
         --cpuctxsw=none
         --capture-range=cudaProfilerApi
+        --capture-range-end=stop
         --force-overwrite=true
         --output "$output_prefix"
         "$PYTHON_EXECUTABLE" "${SCRIPT_DIR}/tools/cuda_profiler_launcher.py"
         --module sglang.bench_offline_throughput --
         "${sglang_args[@]}"
     )
+    if [[ "$DEPENDENCY_TRACE" == "true" ]]; then
+        cmd=("${cmd[@]:0:8}" --cuda-event-trace=true "${cmd[@]:8}")
+    fi
 
     log_info "场景: ${scenario_name}"
+    log_info "模型配置: ${CONFIG_FILE}"
+    log_info "模型路径: ${model_path}"
+    log_info "设备: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<not-set>}"
+    log_info "TP size: ${tensor_parallel}"
     log_info "Nsight 输出: ${expected_report}"
+    nsys_log="${output_prefix}.nsys.log"
+    metadata_path="${expected_report}.metadata.json"
+    log_info "Nsight 日志: ${nsys_log}"
+    build_parse_command "$expected_report"
     if [[ "$DRY_RUN" == "true" ]]; then
-        print_command "${cmd[@]}"
+        print_command "[DRY-RUN]" "${cmd[@]}"
+        if [[ "$PARSE_REPORT" == "true" ]]; then
+            print_command "[DRY-RUN PARSE]" "${parse_cmd[@]}"
+        fi
         return 0
     fi
 
     mkdir -p "$(dirname "$output_prefix")"
-    "${cmd[@]}"
+    : > "$nsys_log"
+    print_command "[COMMAND]" "${cmd[@]}" | tee -a "$nsys_log"
+    set +e
+    "${cmd[@]}" 2>&1 | tee -a "$nsys_log"
+    nsys_status=${PIPESTATUS[0]}
+    set -e
+    if [[ "$nsys_status" -ne 0 ]]; then
+        log_error "nsys profile 失败，退出码 ${nsys_status}；日志: ${nsys_log}"
+        return "$nsys_status"
+    fi
     if [[ ! -f "$expected_report" ]]; then
         log_error "nsys 命令完成但未找到报告: ${expected_report}"
         exit 1
+    fi
+    report_size=$(wc -c < "$expected_report" | tr -d '[:space:]')
+    log_info "Report size: ${report_size} bytes (${expected_report})"
+    write_capture_metadata \
+        "$metadata_path" "$expected_report" "$model_name" "$model_path" \
+        "$scenario_name" "$dataset_name" "$tensor_parallel" "$output_prefix" \
+        "$nsys_log" "${cmd[@]}"
+    log_info "采集元数据: ${metadata_path}"
+    if [[ "$PARSE_REPORT" == "true" ]]; then
+        print_command "[PARSE COMMAND]" "${parse_cmd[@]}"
+        "${parse_cmd[@]}"
     fi
 }
 
@@ -304,6 +473,22 @@ main() {
     parse_args "$@"
     if [[ "$NSYS_PROFILE" != "true" ]]; then
         log_error "必须指定 --nsys 才会启动 Nsight Systems profiling"
+        exit 2
+    fi
+    if [[ "$CAPTURE_MODE" == "server-steps" ]]; then
+        log_error "--capture-mode server-steps is deferred; 当前版本只实现 full-offline"
+        exit 2
+    fi
+    if [[ "$CAPTURE_MODE" != "full-offline" ]]; then
+        log_error "--capture-mode 仅支持 full-offline，当前值: ${CAPTURE_MODE}"
+        exit 2
+    fi
+    if [[ ! "$PARSE_TOP" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "--parse-top 必须是正整数"
+        exit 2
+    fi
+    if [[ "$PARSE_REPORT" != "true" && ( "$FORCE_PARSE_EXPORT" == "true" || "$ANALYZE_DEPENDENCIES" == "true" || "$ANALYZE_COMMUNICATION" == "true" || -n "$PARSE_OUTPUT_DIR" ) ]]; then
+        log_error "parser 相关参数要求同时指定 --parse"
         exit 2
     fi
     case "$SCENARIO_TYPE" in

@@ -114,6 +114,17 @@ class SGLangNsysWorkflowTest(unittest.TestCase):
         yq = self.bin_dir / "yq"
         yq.write_text(FAKE_YQ, encoding="utf-8")
         yq.chmod(0o755)
+        nsys = self.bin_dir / "nsys"
+        nsys.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib,sys\n"
+            "a=sys.argv[1:]\n"
+            "p=a[a.index('--output')+1]\n"
+            "pathlib.Path(p+'.nsys-rep').write_bytes(b'fake-report')\n"
+            "print('fake nsys capture output')\n",
+            encoding="utf-8",
+        )
+        nsys.chmod(0o755)
         self.config_paths = []
 
     def tearDown(self):
@@ -158,6 +169,8 @@ class SGLangNsysWorkflowTest(unittest.TestCase):
         self.assertIn("--sample=none", result.stdout)
         self.assertIn("--cpuctxsw=none", result.stdout)
         self.assertIn("--capture-range=cudaProfilerApi", result.stdout)
+        self.assertIn("--capture-range-end=stop", result.stdout)
+        self.assertIn("--trace-fork-before-exec=true", result.stdout)
         self.assertNotIn(" --profile ", result.stdout)
         self.assertNotIn("SGLANG_TORCH_PROFILER", result.stdout)
         self.assertIn(
@@ -291,6 +304,107 @@ class SGLangNsysWorkflowTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--nsys-output", result.stdout)
         self.assertIn("--scenario", result.stdout)
+        self.assertIn("--parse-top", result.stdout)
+        self.assertIn("--analyze-dependencies", result.stdout)
+
+    def test_parse_and_dependency_options_are_forwarded_in_dry_run(self):
+        suffix = self.write_config(
+            make_config(
+                "Qwen3.6-35B-A3B-FP8-TP4-Test",
+                "/models/Qwen3.6-35B-A3B-FP8",
+                4,
+            )
+        )
+        output_dir = Path(self.temp_dir.name) / "summary"
+        result = self.run_workflow(
+            suffix,
+            "--nsys",
+            "--dry-run",
+            "--parse",
+            "--parse-top",
+            "7",
+            "--parse-output-dir",
+            str(output_dir),
+            "--force-parse-export",
+            "--analyze-dependencies",
+            "--analyze-communication",
+            "--dependency-trace",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--cuda-event-trace=true", result.stdout)
+        self.assertIn("parse_nsys.py", result.stdout)
+        self.assertIn("--top 7", result.stdout)
+        self.assertIn("--force-export", result.stdout)
+        self.assertIn("--analyze-dependencies", result.stdout)
+        self.assertIn("--analyze-communication", result.stdout)
+        self.assertIn(str(output_dir), result.stdout)
+
+    def test_dependency_trace_is_off_by_default(self):
+        suffix = self.write_config(
+            make_config(
+                "Qwen3.6-35B-A3B-FP8-TP4-Test",
+                "/models/Qwen3.6-35B-A3B-FP8",
+                4,
+            )
+        )
+        result = self.run_workflow(suffix, "--nsys", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--cuda-event-trace=true", result.stdout)
+
+    def test_capture_writes_log_metadata_and_report_size(self):
+        model_name = "Qwen3.6-35B-A3B-FP8-TP4-Test"
+        suffix = self.write_config(
+            make_config(model_name, "/models/Qwen3.6-35B-A3B-FP8", 4)
+        )
+        prefix = Path(self.temp_dir.name) / "capture"
+        result = self.run_workflow(
+            suffix,
+            "--nsys",
+            "--nsys-output",
+            str(prefix),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = Path(str(prefix) + ".nsys-rep")
+        metadata = Path(str(report) + ".metadata.json")
+        log = Path(str(prefix) + ".nsys.log")
+        self.assertTrue(report.is_file())
+        self.assertTrue(metadata.is_file())
+        self.assertTrue(log.is_file())
+        self.assertIn("fake nsys capture output", log.read_text())
+        value = json.loads(metadata.read_text())
+        self.assertEqual(value["tp_size"], 4)
+        self.assertEqual(value["capture_mode"], "full-offline")
+        self.assertIn("report size", result.stdout.lower())
+
+    def test_server_steps_is_explicitly_deferred(self):
+        suffix = self.write_config(
+            make_config(
+                "Qwen3.6-35B-A3B-FP8-TP4-Test",
+                "/models/Qwen3.6-35B-A3B-FP8",
+                4,
+            )
+        )
+        result = self.run_workflow(
+            suffix, "--nsys", "--dry-run", "--capture-mode", "server-steps"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("server-steps", result.stderr)
+        self.assertIn("deferred", result.stderr.lower())
+
+    def test_torch_profiler_cli_flag_has_clear_mutual_exclusion_error(self):
+        suffix = self.write_config(
+            make_config(
+                "Qwen3.6-35B-A3B-FP8-TP4-Test",
+                "/models/Qwen3.6-35B-A3B-FP8",
+                4,
+            )
+        )
+        result = self.run_workflow(suffix, "--nsys", "--profile")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Torch Profiler", result.stderr)
+        self.assertIn("Nsight", result.stderr)
 
 
 if __name__ == "__main__":
