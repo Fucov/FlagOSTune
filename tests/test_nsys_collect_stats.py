@@ -132,6 +132,21 @@ class NsysCollectStatsTest(unittest.TestCase):
             self.assertNotIn("nsys-rep", line)
             self.assertNotIn("force-export", line)
 
+    def test_none_supported_set_directly_probes_selected_reports(self):
+        result = collect_reports(
+            self.sqlite,
+            ["cuda_gpu_kern_sum", "cuda_api_sum"],
+            None,
+            str(self.nsys),
+            self.summary,
+            self.progress,
+        )
+
+        self.assertEqual(set(result.successful), {"cuda_gpu_kern_sum", "cuda_api_sum"})
+        calls = self.calls.read_text()
+        self.assertIn("--report cuda_gpu_kern_sum", calls)
+        self.assertIn("--report cuda_api_sum", calls)
+
     def test_optional_report_failure_warns_and_core_failure_is_fatal(self):
         os.environ["FAKE_NSYS_FAIL"] = "nvtx_sum"
         optional = collect_reports(

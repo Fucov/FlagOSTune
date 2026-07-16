@@ -61,7 +61,10 @@ def select_reports(
 
 
 def detect_supported_reports(
-    nsys_path: str, output_dir: Path, progress: ProgressReporter
+    nsys_path: str,
+    output_dir: Path,
+    progress: ProgressReporter,
+    warnings: Optional[List[WarningRecord]] = None,
 ) -> Set[str]:
     command = [nsys_path, "stats", "--help-reports"]
     help_path = output_dir / ".help-reports.txt"
@@ -97,6 +100,8 @@ def detect_supported_reports(
         message = (
             f"nsys stats --help-reports returned exit {code}, but its help body is valid; continuing"
         )
+        if warnings is not None:
+            warnings.append(WarningRecord("detect_reports", message))
         progress.finish(
             "Detect supported reports", started, "WARNING", detail=f"supported={len(supported)}"
         )
@@ -111,7 +116,7 @@ def detect_supported_reports(
 def collect_reports(
     sqlite_path: Path,
     report_names: Sequence[str],
-    supported_reports: Set[str],
+    supported_reports: Optional[Set[str]],
     nsys_path: str,
     output_dir: Path,
     progress: ProgressReporter,
@@ -119,7 +124,7 @@ def collect_reports(
     output_dir.mkdir(parents=True, exist_ok=True)
     collection = ReportCollection()
     for report_name in report_names:
-        if report_name not in supported_reports:
+        if supported_reports is not None and report_name not in supported_reports:
             message = f"optional Nsight report unsupported: {report_name}"
             if report_name == CORE_REPORT:
                 raise CoreReportError(message)

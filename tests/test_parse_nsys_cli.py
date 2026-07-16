@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -19,6 +20,12 @@ if a[0] == 'export':
  c.execute('create table CUPTI_ACTIVITY_KIND_KERNEL (deviceId integer, globalPid integer, start integer, end integer, name text)')
  c.execute("insert into CUPTI_ACTIVITY_KIND_KERNEL values (0,1,0,100,'gemm')")
  c.commit(); c.close(); print('export progress', file=sys.stderr, flush=True); raise SystemExit
+if '--help-reports' in a and os.environ.get('NSYS_HELP_EMPTY'):
+ print('', end=''); raise SystemExit(1)
+if '--help-reports' in a and os.environ.get('NSYS_HELP_EXIT_ONE'):
+ print('The following built-in reports are available:')
+ print('cuda_gpu_kern_sum cuda_api_sum nvtx_sum')
+ raise SystemExit(1)
 if '--help-reports' in a:
  print('cuda_gpu_kern_sum cuda_gpu_kern_sum:base cuda_gpu_kern_gb_sum cuda_kern_exec_sum:base cuda_api_sum nvtx_sum nvtx_gpu_proj_sum cuda_gpu_mem_time_sum cuda_gpu_mem_size_sum cuda_gpu_trace:base cuda_kern_exec_trace:base nvtx_kern_sum:base nvtx_gpu_proj_trace'); raise SystemExit
 r=a[a.index('--report')+1]
@@ -110,6 +117,62 @@ class ParseNsysCliTest(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("direct SQLite", result.stderr)
+
+    def test_help_failure_probes_reports_and_reuses_qwen_sqlite(self):
+        self.report = self.root / "qwen-tp4-full.nsys-rep"
+        self.report.write_bytes(b"existing report")
+        sqlite_path = self.root / "qwen-tp4-full.sqlite"
+        connection = sqlite3.connect(str(sqlite_path))
+        connection.execute(
+            "create table CUPTI_ACTIVITY_KIND_KERNEL "
+            "(deviceId integer, globalPid integer, start integer, end integer, name text)"
+        )
+        connection.execute(
+            "insert into CUPTI_ACTIVITY_KIND_KERNEL values (0, 1, 0, 100, 'gemm')"
+        )
+        connection.commit()
+        connection.close()
+        newer = self.report.stat().st_mtime + 10
+        os.utime(sqlite_path, (newer, newer))
+
+        result = self.run_parser(
+            "--reports", "cuda_api_sum", extra_env={"NSYS_HELP_EMPTY": "1"}
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls.read_text().splitlines()
+        self.assertFalse(any(line.startswith("export ") for line in calls))
+        self.assertTrue(any("--report cuda_gpu_kern_sum" in line for line in calls))
+        self.assertTrue(any("--report cuda_api_sum" in line for line in calls))
+        self.assertIn("WARNING", result.stderr)
+        metadata = json.loads((self.root / "summary" / "metadata.json").read_text())
+        self.assertTrue(any("help-reports" in warning["message"] for warning in metadata["warnings"]))
+
+    def test_fallback_optional_failure_warns_and_core_failure_is_fatal(self):
+        optional = self.run_parser(
+            "--reports",
+            "nvtx_sum",
+            extra_env={"NSYS_HELP_EMPTY": "1", "NSYS_FAIL": "nvtx_sum"},
+        )
+        self.assertEqual(optional.returncode, 0, optional.stderr)
+        self.assertIn("WARNING", optional.stderr)
+
+        self.calls.unlink(missing_ok=True)
+        core = self.run_parser(
+            extra_env={"NSYS_HELP_EMPTY": "1", "NSYS_FAIL": "cuda_gpu_kern_sum"}
+        )
+        self.assertNotEqual(core.returncode, 0)
+        self.assertIn("cuda_gpu_kern_sum", core.stderr)
+
+    def test_valid_nonzero_help_warning_is_saved_in_metadata(self):
+        result = self.run_parser(
+            "--reports", "cuda_api_sum", extra_env={"NSYS_HELP_EXIT_ONE": "1"}
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata = json.loads((self.root / "summary" / "metadata.json").read_text())
+        messages = [warning["message"] for warning in metadata["warnings"]]
+        self.assertTrue(any("exit 1" in message and "help body is valid" in message for message in messages))
 
 
 if __name__ == "__main__":

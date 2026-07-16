@@ -250,10 +250,22 @@ def main(argv: Optional[List[str]] = None) -> int:
             progress=progress,
         )
         version = _nsys_version(args.nsys, output_dir, progress)
-        supported = detect_supported_reports(args.nsys, output_dir, progress)
+        detection_warnings = []
+        try:
+            supported = detect_supported_reports(
+                args.nsys, output_dir, progress, warnings=detection_warnings
+            )
+        except CoreReportError as exc:
+            message = (
+                f"{exc}; falling back to direct report probes against the existing SQLite"
+            )
+            detection_warnings.append(WarningRecord("detect_reports", message))
+            progress.warning(message)
+            supported = None
         collection = collect_reports(
             sqlite_path, selected, supported, args.nsys, output_dir, progress
         )
+        collection.warnings.extend(detection_warnings)
 
         started = progress.begin("Normalize and classify kernel reports")
         kernels = load_kernel_summary(collection.successful["cuda_gpu_kern_sum"])
