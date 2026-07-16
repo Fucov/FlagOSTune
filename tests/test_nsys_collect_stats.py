@@ -1,0 +1,129 @@
+import io
+import os
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+
+from scripts.tools.nsys.collect_stats import (
+    CoreReportError,
+    collect_reports,
+    detect_supported_reports,
+    report_filename,
+    select_reports,
+)
+from scripts.tools.nsys.progress import ProgressReporter
+
+
+FAKE_NSYS = """#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+with open(os.environ['FAKE_NSYS_CALLS'], 'a', encoding='utf-8') as handle:
+    handle.write(' '.join(args) + '\\n')
+if '--help-reports' in args:
+    print('cuda_gpu_kern_sum cuda_gpu_kern_sum:base cuda_api_sum nvtx_sum')
+    raise SystemExit(0)
+report = args[args.index('--report') + 1]
+if report == os.environ.get('FAKE_NSYS_FAIL'):
+    print('missing table', file=sys.stderr, flush=True)
+    raise SystemExit(9)
+print('Time (%),Total Time (ns),Instances,Avg (ns),Name')
+print('100,1000,1,1000,' + report)
+"""
+
+
+class NsysCollectStatsTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.summary = self.root / "summary"
+        self.summary.mkdir()
+        self.sqlite = self.root / "capture.sqlite"
+        connection = sqlite3.connect(str(self.sqlite))
+        connection.execute("create table fixture(value integer)")
+        connection.commit()
+        connection.close()
+        self.nsys = self.root / "nsys"
+        self.nsys.write_text(FAKE_NSYS, encoding="utf-8")
+        self.nsys.chmod(0o755)
+        self.calls = self.root / "calls"
+        self.old_env = dict(os.environ)
+        os.environ["FAKE_NSYS_CALLS"] = str(self.calls)
+        self.stderr = io.StringIO()
+        self.progress = ProgressReporter(20, self.stderr, self.summary / "progress.log")
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.old_env)
+        self.temp_dir.cleanup()
+
+    def test_report_filename_is_filesystem_safe(self):
+        self.assertEqual(report_filename("cuda_gpu_kern_sum:base"), "cuda_gpu_kern_sum_base.csv")
+
+    def test_detects_supported_reports_without_force_export(self):
+        supported = detect_supported_reports(str(self.nsys), self.summary, self.progress)
+
+        self.assertIn("cuda_gpu_kern_sum", supported)
+        calls = self.calls.read_text()
+        self.assertIn("stats --help-reports", calls)
+        self.assertNotIn("force-export", calls)
+
+    def test_collects_each_report_from_sqlite_and_persists_csv(self):
+        result = collect_reports(
+            self.sqlite,
+            ["cuda_gpu_kern_sum", "cuda_api_sum"],
+            {"cuda_gpu_kern_sum", "cuda_api_sum"},
+            str(self.nsys),
+            self.summary,
+            self.progress,
+        )
+
+        self.assertEqual(set(result.successful), {"cuda_gpu_kern_sum", "cuda_api_sum"})
+        self.assertTrue((self.summary / "cuda_gpu_kern_sum.csv").is_file())
+        self.assertTrue((self.summary / "cuda_api_sum.csv").is_file())
+        for line in self.calls.read_text().splitlines():
+            self.assertIn(str(self.sqlite), line)
+            self.assertNotIn("nsys-rep", line)
+            self.assertNotIn("force-export", line)
+
+    def test_optional_report_failure_warns_and_core_failure_is_fatal(self):
+        os.environ["FAKE_NSYS_FAIL"] = "nvtx_sum"
+        optional = collect_reports(
+            self.sqlite,
+            ["cuda_gpu_kern_sum", "nvtx_sum"],
+            {"cuda_gpu_kern_sum", "nvtx_sum"},
+            str(self.nsys),
+            self.summary,
+            self.progress,
+        )
+        self.assertIn("nvtx_sum", optional.failed)
+        self.assertIn("WARNING", self.stderr.getvalue())
+
+        os.environ["FAKE_NSYS_FAIL"] = "cuda_gpu_kern_sum"
+        with self.assertRaisesRegex(CoreReportError, "cuda_gpu_kern_sum"):
+            collect_reports(
+                self.sqlite,
+                ["cuda_gpu_kern_sum"],
+                {"cuda_gpu_kern_sum"},
+                str(self.nsys),
+                self.summary,
+                self.progress,
+            )
+
+    def test_unsupported_optional_warns_and_core_is_always_selected(self):
+        selected = select_reports("cuda_api_sum", False, False)
+        self.assertEqual(selected[0], "cuda_gpu_kern_sum")
+        result = collect_reports(
+            self.sqlite,
+            ["cuda_gpu_kern_sum", "nvtx_gpu_proj_sum"],
+            {"cuda_gpu_kern_sum"},
+            str(self.nsys),
+            self.summary,
+            self.progress,
+        )
+        self.assertEqual(result.unsupported, ["nvtx_gpu_proj_sum"])
+        self.assertIn("unsupported", self.stderr.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()
