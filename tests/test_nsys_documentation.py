@@ -23,6 +23,11 @@ class NsysDocumentationTest(unittest.TestCase):
             "nsys_analysis.md",
             "server-steps",
             "decode-only",
+            "--profile-phase prefill",
+            "--profile-phase decode",
+            "cuda_gpu_trace:nvtx-name",
+            "raw_report_integrity",
+            "analysis_completeness",
         )
         for value in required:
             self.assertIn(value, text)

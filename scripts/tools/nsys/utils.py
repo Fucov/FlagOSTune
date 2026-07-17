@@ -105,4 +105,46 @@ def read_csv_rows(path: Path) -> List[dict]:
     if not path.is_file() or path.stat().st_size == 0:
         return []
     with path.open(encoding="utf-8-sig", newline="") as handle:
-        return list(csv.DictReader(handle))
+        rows = list(csv.reader(handle))
+    header_index = None
+    for index, row in enumerate(rows):
+        if len(row) < 2:
+            continue
+        joined = " ".join(row).strip().lower()
+        if joined.startswith("processing [") or " with [" in joined:
+            continue
+        header_index = index
+        break
+    if header_index is None:
+        return []
+    header = [str(value).strip() for value in rows[header_index]]
+    output = []
+    for row in rows[header_index + 1 :]:
+        if not row or not any(str(value).strip() for value in row):
+            continue
+        if len(row) < len(header):
+            row = list(row) + [""] * (len(header) - len(row))
+        converted = {}
+        for position, name in enumerate(header):
+            value = row[position].strip()
+            normalized_name = normalize_header(name)
+            numeric_header = any(
+                token in normalized_name
+                for token in (
+                    "time", "duration", "instance", "calls", "count", "size",
+                    "bytes", "average", "avg", "median", "minimum", "maximum",
+                    "stddev", "percent", "deviceid", "contextid", "streamid",
+                )
+            )
+            numeric_text = value.replace(",", "")
+            if numeric_header and re.fullmatch(r"[-+]?[0-9]+", numeric_text):
+                converted[name] = int(numeric_text)
+            elif numeric_header and re.fullmatch(
+                r"[-+]?(?:[0-9]+\.[0-9]*|[0-9]*\.[0-9]+)(?:[eE][-+]?[0-9]+)?",
+                numeric_text,
+            ):
+                converted[name] = float(numeric_text)
+            else:
+                converted[name] = value
+        output.append(converted)
+    return output

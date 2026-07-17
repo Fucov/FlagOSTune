@@ -40,6 +40,9 @@ class NsysRenderMarkdownTest(unittest.TestCase):
                 "capture_mode": "full-offline",
                 "profile_phase": "full",
                 "integrity_ok": True,
+                "raw_report_integrity": "PASS",
+                "analysis_completeness": "PARTIAL",
+                "analysis_completeness_reasons": ["event trace unavailable"],
             },
             reports=reports,
             kernels=[KernelSummary("complete_kernel_name", 1000, 5, 100.0, 200)],
@@ -48,7 +51,7 @@ class NsysRenderMarkdownTest(unittest.TestCase):
             native_tables={
                 "cuda_gpu_kern_gb_sum": [{"Grid XYZ": "1 2 3", "Block XYZ": "128 1 1"}],
                 "cuda_api_sum": [{"Name": "cudaLaunchKernel", "Time (%)": "100"}],
-                "cuda_kern_exec_sum:base": [{"API Total Time (ns)": "20", "Queue Total Time (ns)": "10", "Kernel Total Time (ns)": "1000"}],
+                "cuda_kern_exec_sum": [{"API Total Time (ns)": "20", "Queue Total Time (ns)": "10", "Kernel Total Time (ns)": "1000"}],
                 "nvtx_gpu_proj_sum": [],
                 "cuda_gpu_mem_time_sum": [{"Operation": "memcpy", "Total Time (ns)": "10"}],
             },
@@ -66,6 +69,11 @@ class NsysRenderMarkdownTest(unittest.TestCase):
         self.assertIn("Kernel instances | 5", markdown)
         self.assertIn("GPU-0", markdown)
         self.assertIn("NVTX data is empty", markdown)
+        self.assertIn("Raw report integrity: **PASS**", markdown)
+        self.assertIn("Analysis completeness: **PARTIAL**", markdown)
+        self.assertNotIn("['event trace unavailable']", markdown)
+        self.assertIn("includes model initialization", markdown)
+        self.assertIn("cannot be used for stable decode communication share", markdown)
         required = (
             "sum of all kernel durations",
             "not wall-clock",
@@ -85,6 +93,16 @@ class NsysRenderMarkdownTest(unittest.TestCase):
         data = AnalysisData(metadata={}, reports=ReportCollection())
         markdown = render_markdown(data, top=20)
         self.assertIn("N/A", markdown)
+
+    def test_mapping_table_does_not_render_python_list_literals(self):
+        data = AnalysisData(
+            metadata={"analysis_completeness_reasons": ["one", "two"]},
+            reports=ReportCollection(),
+            native_tables={"cuda_api_sum": [{"Names": ["a", "b"]}]},
+        )
+        markdown = render_markdown(data, top=20)
+        self.assertNotIn("['a', 'b']", markdown)
+        self.assertIn('["a", "b"]', markdown)
 
 
 if __name__ == "__main__":

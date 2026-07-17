@@ -3,10 +3,29 @@ import unittest
 from pathlib import Path
 
 from scripts.tools.nsys.normalize_stats import load_kernel_summary
-from scripts.tools.nsys.utils import find_column, normalize_header, parse_duration_ns
+from scripts.tools.nsys.utils import (
+    find_column,
+    normalize_header,
+    parse_duration_ns,
+    read_csv_rows,
+)
 
 
 class NsysNormalizeStatsTest(unittest.TestCase):
+    def test_read_csv_rows_skips_nsys_processing_preamble(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.csv"
+            path.write_text(
+                "Processing [capture.sqlite] with [cuda_api_sum]...\n"
+                'Time (%),Total Time (ns),Name\n'
+                '100,42,"cudaLaunchKernel"\n',
+                encoding="utf-8",
+            )
+            rows = read_csv_rows(path)
+        self.assertEqual(
+            rows,
+            [{"Time (%)": 100, "Total Time (ns)": 42, "Name": "cudaLaunchKernel"}],
+        )
     def test_header_lookup_tolerates_punctuation_and_case(self):
         headers = ["Time:Percent", "TOTAL TIME (ns)", "Kernel Name"]
         self.assertEqual(normalize_header(" Time (%) "), "time")

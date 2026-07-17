@@ -33,7 +33,8 @@ class ClassifiedKernel:
     name: str
     base_family: str
     category: str
-    rule: str
+    classification_rule: str
+    classification_confidence: str
     total_ns: float
     instances: int
     time_percentage: float
@@ -67,6 +68,13 @@ class KernelEvent:
     family: str = "Unknown"
     phase: str = "UNKNOWN"
     module: str = "N/A"
+    process_id: Optional[int] = None
+    thread_id: Optional[int] = None
+    correlation_id: Optional[int] = None
+    nvtx_range: str = "N/A"
+    classification_rule: str = "N/A"
+    classification_confidence: str = "LOW"
+    source_table: str = "N/A"
 
     @property
     def duration_ns(self) -> int:
@@ -138,6 +146,7 @@ class ReportCollection:
     failed: Dict[str, str] = field(default_factory=dict)
     empty: List[str] = field(default_factory=list)
     warnings: List[WarningRecord] = field(default_factory=list)
+    selected_sources: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

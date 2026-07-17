@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterable, List, Tuple
@@ -33,7 +32,7 @@ def build_adjacency(events: Iterable[KernelEvent]) -> List[AdjacencyRecord]:
 
 
 def load_trace_csv(path: Path) -> List[KernelEvent]:
-    """Load the normalized subset of a native `cuda_gpu_trace:base` CSV."""
+    """Load the normalized subset of a native `cuda_gpu_trace` CSV."""
     aliases = {
         "start": ("Start (ns)", "Start", "Start Ns"),
         "duration": ("Duration (ns)", "Duration", "Duration Ns"),
@@ -43,31 +42,30 @@ def load_trace_csv(path: Path) -> List[KernelEvent]:
         "name": ("Name", "Kernel Name"),
     }
     from .classify_kernels import base_family, classify_kernel
-    from .utils import find_column, parse_duration_ns, parse_number
+    from .utils import find_column, parse_duration_ns, parse_number, read_csv_rows
 
-    with path.open(encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        fields = reader.fieldnames or []
-        keys = {name: find_column(fields, values, required=True) for name, values in aliases.items()}
-        events = []
-        for index, row in enumerate(reader):
-            start = int(parse_duration_ns(row[keys["start"]], keys["start"]))
-            duration = int(parse_duration_ns(row[keys["duration"]], keys["duration"]))
-            name = row[keys["name"]].strip()
-            category, _ = classify_kernel(name)
-            events.append(
-                KernelEvent(
-                    index,
-                    int(parse_number(row[keys["device"]])),
-                    int(parse_number(row[keys["context"]])),
-                    int(parse_number(row[keys["stream"]])),
-                    start,
-                    start + duration,
-                    name,
-                    category,
-                    base_family(name),
-                )
+    rows = read_csv_rows(path)
+    fields = list(rows[0]) if rows else []
+    keys = {name: find_column(fields, values, required=True) for name, values in aliases.items()}
+    events = []
+    for index, row in enumerate(rows):
+        start = int(parse_duration_ns(row[keys["start"]], keys["start"]))
+        duration = int(parse_duration_ns(row[keys["duration"]], keys["duration"]))
+        name = row[keys["name"]].strip()
+        classification = classify_kernel(name)
+        events.append(
+            KernelEvent(
+                index,
+                int(parse_number(row[keys["device"]])),
+                int(parse_number(row[keys["context"]])),
+                int(parse_number(row[keys["stream"]])),
+                start,
+                start + duration,
+                name,
+                classification.category,
+                base_family(name),
             )
+        )
     return events
 
 

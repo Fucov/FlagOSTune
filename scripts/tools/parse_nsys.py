@@ -26,7 +26,11 @@ from scripts.tools.nsys.analyze_communication import (
 from scripts.tools.nsys.analyze_dependencies import build_adjacency, load_trace_csv
 from scripts.tools.nsys.analyze_devices import analyze_devices, write_device_summary
 from scripts.tools.nsys.analyze_phases import attribute_phase
-from scripts.tools.nsys.classify_kernels import classify_kernels, write_classification
+from scripts.tools.nsys.classify_kernels import (
+    classify_kernel,
+    classify_kernels,
+    write_classification,
+)
 from scripts.tools.nsys.collect_stats import (
     CoreReportError,
     collect_reports,
@@ -34,10 +38,17 @@ from scripts.tools.nsys.collect_stats import (
     select_reports,
 )
 from scripts.tools.nsys.export_report import ExportError, resolve_sqlite
+from scripts.tools.nsys.evaluate_integrity import IntegrityInputs, evaluate_integrity
 from scripts.tools.nsys.models import AnalysisData, KernelSummary, WarningRecord
 from scripts.tools.nsys.normalize_stats import load_kernel_summary
 from scripts.tools.nsys.progress import ProgressReporter, run_streaming_command
 from scripts.tools.nsys.render_markdown import render_markdown
+from scripts.tools.nsys.sqlite_events import (
+    load_kernel_events,
+    load_memory_events,
+    write_event_artifacts,
+    write_kernel_summary_from_events,
+)
 from scripts.tools.nsys.utils import atomic_write_json, normalize_header, read_csv_rows
 
 
@@ -138,6 +149,15 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def _optional_float(value: object) -> Optional[float]:
+    if value in (None, "", "null"):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report", type=Path, help="input .nsys-rep or .sqlite file")
@@ -222,6 +242,7 @@ def _metadata(
             "unsupported_reports": collection.unsupported,
             "failed_reports": collection.failed,
             "empty_reports": collection.empty,
+            "report_sources": collection.selected_sources,
             "captured_gpu_count": len(devices),
             "captured_devices": [row.__dict__ for row in devices],
             "integrity_ok": integrity,
@@ -263,13 +284,49 @@ def main(argv: Optional[List[str]] = None) -> int:
             progress.warning(message)
             supported = None
         collection = collect_reports(
-            sqlite_path, selected, supported, args.nsys, output_dir, progress
+            sqlite_path,
+            selected,
+            supported,
+            args.nsys,
+            output_dir,
+            progress,
+            allow_core_fallback=True,
         )
         collection.warnings.extend(detection_warnings)
 
+        started = progress.begin("Inspect SQLite event schema", input_path=sqlite_path)
+        extraction = load_kernel_events(sqlite_path)
+        write_event_artifacts(extraction, output_dir)
+        for message in extraction.missing_capabilities:
+            collection.warnings.append(WarningRecord("sqlite_events", message))
+            progress.warning(message)
+        progress.finish(
+            "Inspect SQLite event schema",
+            started,
+            "WARNING" if extraction.missing_capabilities else "SUCCESS",
+            output_path=output_dir / "sqlite_schema.json",
+        )
+        if "cuda_gpu_kern_sum" not in collection.successful:
+            if not extraction.events:
+                raise CoreReportError(
+                    "cuda_gpu_kern_sum is unavailable and direct SQLite query "
+                    "did not find kernel events"
+                )
+            sqlite_summary = output_dir / "cuda_gpu_kern_sum.csv"
+            write_kernel_summary_from_events(extraction.events, sqlite_summary)
+            collection.successful["cuda_gpu_kern_sum"] = sqlite_summary
+            collection.selected_sources["cuda_gpu_kern_sum"] = "direct SQLite query"
+            collection.failed.pop("cuda_gpu_kern_sum", None)
+            warning = WarningRecord(
+                "collect_stats",
+                "cuda_gpu_kern_sum is unavailable; generated core summary from direct SQLite query",
+            )
+            collection.warnings.append(warning)
+            progress.warning(warning.message)
+
         started = progress.begin("Normalize and classify kernel reports")
         kernels = load_kernel_summary(collection.successful["cuda_gpu_kern_sum"])
-        base_path = collection.successful.get("cuda_gpu_kern_sum:base")
+        base_path = collection.successful.get("cuda_gpu_kern_sum_base")
         base_kernels = load_kernel_summary(base_path) if base_path else kernels
         classified = classify_kernels(kernels)
         write_classification(classified, output_dir)
@@ -290,10 +347,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         communication_events = []
         chains = []
         candidates = []
-        trace_path = collection.successful.get("cuda_gpu_trace:base")
-        if (args.analyze_dependencies or args.analyze_communication) and trace_path:
-            started = progress.begin("Analyze event dependencies and communication", input_path=trace_path)
-            events = [replace(row, phase=phase.phase) for row in load_trace_csv(trace_path)]
+        trace_path = collection.successful.get("cuda_gpu_trace")
+        if args.analyze_dependencies or args.analyze_communication:
+            event_source = trace_path or sqlite_path
+            started = progress.begin("Analyze event dependencies and communication", input_path=event_source)
+            raw_events = load_trace_csv(trace_path) if trace_path else extraction.events
+            events = [replace(row, phase=phase.phase) for row in raw_events]
+        if (args.analyze_dependencies or args.analyze_communication) and events:
             adjacency = build_adjacency(events)
             communication_events = analyze_communication(events)
             chains = build_communication_chains(events, adjacency, communication_events)
@@ -301,17 +361,118 @@ def main(argv: Optional[List[str]] = None) -> int:
             write_communication_analysis(adjacency, communication_events, chains, candidates, output_dir)
             progress.finish("Analyze event dependencies and communication", started, output_path=output_dir / "communication_events.csv")
         elif args.analyze_dependencies or args.analyze_communication:
-            warning = WarningRecord("dependencies", "cuda_gpu_trace:base is unavailable; event analysis was not generated")
+            warning = WarningRecord(
+                "dependencies",
+                "native CUDA trace and SQLite kernel events are unavailable; event analysis was not generated",
+            )
             collection.warnings.append(warning)
             progress.warning(warning.message)
+            progress.finish(
+                "Analyze event dependencies and communication",
+                started,
+                "WARNING",
+                detail=warning.message,
+            )
+
+        memory_events = load_memory_events(sqlite_path)
+        memory_time_ns = sum(row.end_ns - row.start_ns for row in memory_events)
+        h2d_time_ns = sum(
+            row.end_ns - row.start_ns
+            for row in memory_events
+            if "h2d" in row.kind.lower()
+            or "htod" in row.kind.lower()
+            or row.kind.strip() == "1"
+        )
+        all_events = events or extraction.events
+        runtime_collectives = [
+            row for row in all_events if classify_kernel(row.name).runtime_communication
+        ]
+        requested_phase = str(
+            capture.get("requested_phase") or capture.get("profile_phase") or ""
+        )
+        capture_log_text = ""
+        capture_log_path = capture.get("server_log") or capture.get("nsys_log")
+        if capture_log_path:
+            candidate_log = Path(str(capture_log_path))
+            if candidate_log.is_file():
+                capture_log_text = candidate_log.read_text(
+                    encoding="utf-8", errors="replace"
+                ).lower()
+        deepgemm_jit_detected = bool(
+            capture.get("deepgemm_jit_detected")
+            or ("deepgemm" in capture_log_text and "jit" in capture_log_text)
+            or any(
+                "deep_gemm" in row.name.lower() and "jit" in row.name.lower()
+                for row in all_events
+            )
+        )
+        moe_config_fallback_detected = bool(
+            capture.get("moe_config_fallback_detected")
+            or ("moe" in capture_log_text and "fallback" in capture_log_text)
+        )
+        invalid_timestamps = sum(row.end_ns < row.start_ns for row in all_events)
+        integrity_result = evaluate_integrity(
+            IntegrityInputs(
+                report_size=report.stat().st_size,
+                sqlite_size=sqlite_path.stat().st_size,
+                kernel_event_count=len(all_events),
+                invalid_timestamp_count=invalid_timestamps,
+                requested_dependencies=args.analyze_dependencies,
+                requested_communication=args.analyze_communication,
+                event_trace_available=bool(all_events),
+                communication_capability=bool(all_events),
+                expected_tp=expected_tp,
+                captured_devices=tuple(row.device_id for row in devices),
+                requested_phase=requested_phase,
+                detected_phase=phase.phase,
+                initialization_only=bool(all_events) and all(
+                    row.category == "Communication Init" for row in all_events
+                ),
+                runtime_collective_count=len(runtime_collectives),
+                capture_duration_seconds=_optional_float(
+                    capture.get("capture_duration_seconds")
+                ),
+                benchmark_duration_seconds=_optional_float(
+                    capture.get("benchmark_duration_seconds")
+                ),
+                kernel_time_ns=sum(row.duration_ns for row in all_events),
+                h2d_time_ns=h2d_time_ns,
+                memory_time_ns=memory_time_ns,
+                largest_nvtx=nvtx_names[0] if nvtx_names else "",
+                capture_mode=str(capture.get("capture_mode") or "unknown"),
+                deepgemm_jit_detected=deepgemm_jit_detected,
+            )
+        )
 
         native_tables = {
             name: read_csv_rows(path)
             for name, path in collection.successful.items()
-            if name not in ("cuda_gpu_kern_sum", "cuda_gpu_kern_sum:base")
+            if name not in ("cuda_gpu_kern_sum", "cuda_gpu_kern_sum_base")
         }
         metadata = _metadata(args, report, sqlite_path, version, capture, collection, devices, integrity)
         metadata["profile_phase_attribution"] = phase.__dict__
+        metadata["requested_phase"] = requested_phase or None
+        metadata["detected_phase"] = phase.phase
+        metadata["phase_confidence"] = phase.confidence
+        metadata["phase_evidence"] = phase.evidence
+        metadata["deepgemm_jit_detected"] = deepgemm_jit_detected
+        metadata["moe_config_fallback_detected"] = moe_config_fallback_detected
+        metadata["event_trace_source"] = (
+            collection.selected_sources.get("cuda_gpu_trace")
+            if trace_path
+            else "direct SQLite query" if extraction.events else None
+        )
+        metadata["sqlite_missing_capabilities"] = extraction.missing_capabilities
+        metadata["raw_report_integrity"] = integrity_result.raw_report_integrity
+        metadata["analysis_completeness"] = integrity_result.analysis_completeness
+        metadata["raw_integrity_reasons"] = list(integrity_result.raw_reasons)
+        metadata["analysis_completeness_reasons"] = list(integrity_result.analysis_reasons)
+        metadata["capture_sanity_checks"] = list(integrity_result.sanity_checks)
+        metadata.update(integrity_result.flags)
+        metadata["integrity_ok"] = (
+            integrity_result.raw_report_integrity == "PASS"
+            and integrity_result.analysis_completeness == "PASS"
+        )
         metadata["warnings"] = [row.__dict__ for row in collection.warnings + device_warnings]
         started = progress.begin("Write metadata", output_path=output_dir / "metadata.json")
         atomic_write_json(output_dir / "metadata.json", metadata)

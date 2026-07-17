@@ -119,6 +119,9 @@ class SGLangNsysWorkflowTest(unittest.TestCase):
             "#!/usr/bin/env python3\n"
             "import pathlib,sys\n"
             "a=sys.argv[1:]\n"
+            "if '--version' in a:\n"
+            " print('NVIDIA Nsight Systems version 2025.3.1')\n"
+            " raise SystemExit(0)\n"
             "p=a[a.index('--output')+1]\n"
             "pathlib.Path(p+'.nsys-rep').write_bytes(b'fake-report')\n"
             "print('fake nsys capture output')\n",
@@ -376,9 +379,17 @@ class SGLangNsysWorkflowTest(unittest.TestCase):
         value = json.loads(metadata.read_text())
         self.assertEqual(value["tp_size"], 4)
         self.assertEqual(value["capture_mode"], "full-offline")
+        self.assertEqual(value["capture_scope"], "startup_and_full_process")
+        self.assertEqual(value["profile_phase"], "full_process")
+        self.assertFalse(value["steady_state_guaranteed"])
+        self.assertIn("git_commit", value)
+        self.assertIn("git_dirty", value)
+        self.assertRegex(value["workflow_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(value["parser_sha256"], r"^[0-9a-f]{64}$")
+        self.assertIn("2025.3.1", value["nsys_version"])
         self.assertIn("report size", result.stdout.lower())
 
-    def test_server_steps_is_explicitly_deferred(self):
+    def test_server_steps_prefill_dry_run_builds_server_and_client(self):
         suffix = self.write_config(
             make_config(
                 "Qwen3.6-35B-A3B-FP8-TP4-Test",
@@ -387,11 +398,151 @@ class SGLangNsysWorkflowTest(unittest.TestCase):
             )
         )
         result = self.run_workflow(
-            suffix, "--nsys", "--dry-run", "--capture-mode", "server-steps"
+            suffix,
+            "--nsys",
+            "--dry-run",
+            "--capture-mode",
+            "server-steps",
+            "--profile-phase",
+            "prefill",
+            "--profile-start-step",
+            "0",
+            "--profile-num-steps",
+            "4",
+            "--profile-warmup-prompts",
+            "2",
+            "--profile-concurrency",
+            "3",
+            "--profile-ready-timeout",
+            "30",
+            "--cuda-graph-trace",
+            "node",
+            "--layerwise-nvtx",
+            "auto",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sglang_server_steps.py", result.stdout)
+        self.assertIn("sglang.launch_server", result.stdout)
+        self.assertIn("sglang.bench_serving", result.stdout)
+        self.assertIn("--trace-fork-before-exec=true", result.stdout)
+        self.assertIn("--capture-range=cudaProfilerApi", result.stdout)
+        self.assertIn("--capture-range-end=stop", result.stdout)
+        self.assertIn("--cuda-graph-trace=node", result.stdout)
+        self.assertIn("--profile-phase prefill", result.stdout)
+        self.assertIn("--profile-num-steps 4", result.stdout)
+        self.assertIn("--profile-warmup-prompts 2", result.stdout)
+        self.assertIn("--max-concurrency 3", result.stdout)
+
+    def test_server_steps_decode_dry_run_is_log_driven(self):
+        suffix = self.write_config(
+            make_config(
+                "Qwen3.6-35B-A3B-FP8-TP4-Test",
+                "/models/Qwen3.6-35B-A3B-FP8",
+                4,
+            )
+        )
+        result = self.run_workflow(
+            suffix,
+            "--nsys",
+            "--dry-run",
+            "--capture-mode",
+            "server-steps",
+            "--profile-phase",
+            "decode",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--profile-phase decode", result.stdout)
+        self.assertIn("--decode-log-pattern", result.stdout)
+        self.assertNotIn("sleep-before-profile", result.stdout)
+
+    def test_new_profile_options_validate_enums_and_integers(self):
+        suffix = self.write_config(
+            make_config(
+                "Qwen3.6-35B-A3B-FP8-TP4-Test",
+                "/models/Qwen3.6-35B-A3B-FP8",
+                4,
+            )
+        )
+        cases = (
+            (("--profile-phase", "wrong"), "--profile-phase"),
+            (("--profile-num-steps", "0"), "--profile-num-steps"),
+            (("--profile-start-step", "-1"), "--profile-start-step"),
+            (("--cuda-graph-trace", "invalid"), "--cuda-graph-trace"),
+            (("--layerwise-nvtx", "maybe"), "--layerwise-nvtx"),
+        )
+        for arguments, expected in cases:
+            with self.subTest(arguments=arguments):
+                result = self.run_workflow(
+                    suffix,
+                    "--nsys",
+                    "--dry-run",
+                    "--capture-mode",
+                    "server-steps",
+                    *arguments,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stderr)
+
+    def test_full_offline_rejects_decode_label(self):
+        suffix = self.write_config(
+            make_config(
+                "Qwen3.6-35B-A3B-FP8-TP4-Test",
+                "/models/Qwen3.6-35B-A3B-FP8",
+                4,
+            )
+        )
+        result = self.run_workflow(
+            suffix,
+            "--nsys",
+            "--dry-run",
+            "--capture-mode",
+            "full-offline",
+            "--profile-phase",
+            "decode",
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("server-steps", result.stderr)
-        self.assertIn("deferred", result.stderr.lower())
+        self.assertIn("full-offline", result.stderr)
+        self.assertIn("decode", result.stderr)
+
+    def test_full_offline_accepts_startup_but_keeps_full_process_scope(self):
+        suffix = self.write_config(
+            make_config(
+                "Qwen3.6-35B-A3B-FP8-TP4-Test",
+                "/models/Qwen3.6-35B-A3B-FP8",
+                4,
+            )
+        )
+        result = self.run_workflow(
+            suffix,
+            "--nsys",
+            "--dry-run",
+            "--capture-mode",
+            "full-offline",
+            "--profile-phase",
+            "startup",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sglang.bench_offline_throughput", result.stdout)
+
+    def test_help_lists_server_step_options(self):
+        result = subprocess.run(
+            ["bash", str(WORKFLOW), "--help"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for option in (
+            "--profile-phase",
+            "--profile-start-step",
+            "--profile-num-steps",
+            "--profile-warmup-prompts",
+            "--profile-concurrency",
+            "--profile-ready-timeout",
+            "--cuda-graph-trace",
+            "--layerwise-nvtx",
+        ):
+            self.assertIn(option, result.stdout)
 
     def test_torch_profiler_cli_flag_has_clear_mutual_exclusion_error(self):
         suffix = self.write_config(

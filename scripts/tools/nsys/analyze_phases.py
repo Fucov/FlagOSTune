@@ -18,6 +18,10 @@ def _phase_from_text(value: str) -> Optional[str]:
         return "PREFILL"
     if has_decode:
         return "DECODE"
+    if "startup" in lowered or "initialization" in lowered:
+        return "STARTUP"
+    if "full" in lowered:
+        return "FULL"
     return None
 
 
@@ -38,7 +42,13 @@ def attribute_phase(
     metadata_phase = str(metadata.get("profile_phase") or "")
     phase = _phase_from_text(metadata_phase)
     if phase:
-        return PhaseAttribution(phase, "workflow metadata", metadata_phase, "MEDIUM")
+        metadata_evidence = str(metadata.get("phase_evidence") or metadata_phase)
+        metadata_confidence = str(metadata.get("phase_confidence") or "MEDIUM").upper()
+        if metadata_confidence not in ("HIGH", "MEDIUM", "LOW"):
+            metadata_confidence = "MEDIUM"
+        return PhaseAttribution(
+            phase, "workflow metadata", metadata_evidence, metadata_confidence
+        )
     return PhaseAttribution(
         "UNKNOWN", "insufficient evidence", "no explicit NVTX/log/metadata phase evidence", "LOW"
     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 
@@ -33,7 +34,11 @@ SECTION_TITLES = tuple(f"## {index}. {name}" for index, name in enumerate(SECTIO
 def _escape(value: object) -> str:
     if value is None or value == "":
         return "N/A"
-    return str(value).replace("|", "\\|").replace("\n", " ")
+    if isinstance(value, (list, tuple, dict)):
+        rendered = json.dumps(value, ensure_ascii=False, separators=(", ", ": "))
+    else:
+        rendered = str(value)
+    return rendered.replace("|", "\\|").replace("\n", " ")
 
 
 def _mapping_table(rows: Sequence[Mapping[str, object]], top: int) -> str:
@@ -83,6 +88,23 @@ def render_markdown(
     chain_rows = [row.__dict__ for row in data.communication_chains]
     candidate_rows = [row.__dict__ for row in data.fusion_candidates]
     phase = data.phase_attribution
+    raw_integrity = metadata.get("raw_report_integrity") or (
+        "PASS" if metadata.get("integrity_ok") is True else "N/A"
+    )
+    analysis_completeness = metadata.get("analysis_completeness") or (
+        "PASS" if metadata.get("integrity_ok") is True else "N/A"
+    )
+    integrity_reasons = _escape(
+        metadata.get("analysis_completeness_reasons")
+        or metadata.get("raw_integrity_reasons")
+    )
+    full_offline_scope = ""
+    if metadata.get("capture_mode") == "full-offline":
+        full_offline_scope = (
+            "\n- `full-offline` includes model initialization and NCCL init, may "
+            "include DeepGEMM JIT, and cannot be used for stable decode "
+            "communication share."
+        )
 
     sections = [
         "# FlagOSTune Nsight Systems Analysis",
@@ -107,7 +129,11 @@ def render_markdown(
             for key in ("model", "scenario", "workload", "tp_size", "visible_devices", "capture_mode", "profile_phase")
         ),
         SECTION_TITLES[3],
-        f"Integrity status: **{'PASS' if metadata.get('integrity_ok') is True else 'N/A' if metadata.get('integrity_ok') is None else 'FAILED'}**.\n\nWarnings:\n{warnings}",
+        (
+            f"Raw report integrity: **{_escape(raw_integrity)}**.\n\n"
+            f"Analysis completeness: **{_escape(analysis_completeness)}**.\n\n"
+            f"Completeness reasons: `{integrity_reasons}`.\n\nWarnings:\n{warnings}"
+        ),
         SECTION_TITLES[4],
         f"Top {top} base kernel families:\n\n{_kernel_table(data.base_kernels, top)}\n\nKernel grid/block summary (launch-shape proxy):\n\n{_native(data, 'cuda_gpu_kern_gb_sum', top)}",
         SECTION_TITLES[5],
@@ -117,7 +143,7 @@ def render_markdown(
         SECTION_TITLES[7],
         _mapping_table(device_rows, top),
         SECTION_TITLES[8],
-        f"CUDA API Top:\n\n{_native(data, 'cuda_api_sum', top)}\n\nCUDA launch/API/queue/kernel time:\n\n{_native(data, 'cuda_kern_exec_sum:base', top)}",
+        f"CUDA API Top:\n\n{_native(data, 'cuda_api_sum', top)}\n\nCUDA launch/API/queue/kernel time:\n\n{_native(data, 'cuda_kern_exec_sum', top)}",
         SECTION_TITLES[9],
         f"NVTX range summary:\n\n{_native(data, 'nvtx_sum', top)}\n\nNVTX GPU projection:\n\n{_native(data, 'nvtx_gpu_proj_sum', top)}",
         SECTION_TITLES[10],
@@ -143,11 +169,12 @@ def render_markdown(
                 "- Same-stream temporal adjacency is **not a Tensor data dependency**.",
                 "- Kernel grid/block is a launch-shape proxy, **not Tensor shape**.",
                 "- Exposed communication is a **FlagOSTune-derived timeline metric**, not an Nsight critical-path metric.",
+                "- Cross-stream overlap is interval intersection and does **not** prove a truly fused kernel.",
                 "- A full-run trace is not decode-only and must not be described as a decode-only trace.",
                 "- CUDA-graph-disabled measurements do not represent a graph-enabled production path.",
                 "- Conclusions apply to the **captured workload only**.",
             )
-        ),
+        ) + full_offline_scope,
     ]
     markdown = "\n\n".join(sections).rstrip() + "\n"
     if output_path is not None:

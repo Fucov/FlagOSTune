@@ -14,6 +14,93 @@ from .models import (
     KernelEvent,
 )
 from .utils import write_csv
+from .classify_kernels import classify_kernel
+
+
+def _percentile(values: Sequence[int], quantile: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    if len(ordered) == 1:
+        return float(ordered[0])
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+
+def summarize_communication(
+    communication: Sequence[CommunicationEvent],
+) -> List[dict]:
+    grouped = defaultdict(list)
+    for event in communication:
+        classification = classify_kernel(event.name)
+        provider = "NCCL" if classification.category.startswith("NCCL ") else "Custom"
+        if classification.category == "P2P Send/Recv" and "nccl" in event.name.lower():
+            provider = "NCCL"
+        grouped[(event.device_id, provider, classification.category)].append(event)
+    output = []
+    for (device, provider, collective), values in sorted(grouped.items()):
+        durations = [row.duration_ns for row in values]
+        total = sum(durations)
+        overlap = sum(row.overlap_compute_ns for row in values)
+        exposed = sum(row.exposed_communication_ns for row in values)
+        output.append(
+            {
+                "device_id": device,
+                "provider": provider,
+                "collective": collective,
+                "count": len(values),
+                "total_duration_ns": total,
+                "average_ns": total / len(values),
+                "p50_ns": _percentile(durations, 0.50),
+                "p95_ns": _percentile(durations, 0.95),
+                "compute_overlap_ns": overlap,
+                "exposed_communication_ns": exposed,
+                "exposed_ratio": exposed / total if total else 0.0,
+            }
+        )
+    return output
+
+
+def summarize_arrival_skew(
+    communication: Sequence[CommunicationEvent],
+) -> List[dict]:
+    by_collective_device = defaultdict(lambda: defaultdict(list))
+    for event in communication:
+        collective = classify_kernel(event.name).category
+        by_collective_device[collective][event.device_id].append(event)
+    output = []
+    for collective, by_device in sorted(by_collective_device.items()):
+        if len(by_device) < 2:
+            continue
+        ordered = {
+            device: sorted(values, key=lambda row: (row.start_ns, row.event_id))
+            for device, values in by_device.items()
+        }
+        counts = {len(values) for values in ordered.values()}
+        if len(counts) != 1:
+            continue
+        count = counts.pop()
+        for occurrence in range(count):
+            arrivals = {
+                device: values[occurrence].start_ns
+                for device, values in ordered.items()
+            }
+            output.append(
+                {
+                    "collective": collective,
+                    "occurrence": occurrence,
+                    "device_count": len(arrivals),
+                    "earliest_start_ns": min(arrivals.values()),
+                    "latest_start_ns": max(arrivals.values()),
+                    "arrival_skew_ns": max(arrivals.values()) - min(arrivals.values()),
+                    "evidence": "same collective and occurrence order across devices",
+                    "confidence": "MEDIUM",
+                }
+            )
+    return output
 
 
 def _union_length(intervals: Iterable[Tuple[int, int]], lower: int, upper: int) -> int:
@@ -36,11 +123,11 @@ def analyze_communication(events: Iterable[KernelEvent]) -> List[CommunicationEv
     materialized = list(events)
     computes = defaultdict(list)
     for event in materialized:
-        if event.category != "NCCL Communication":
+        if not classify_kernel(event.name).runtime_communication:
             computes[event.device_id].append((event.start_ns, event.end_ns))
     output = []
     for event in materialized:
-        if event.category != "NCCL Communication":
+        if not classify_kernel(event.name).runtime_communication:
             continue
         duration = event.duration_ns
         overlap = _union_length(computes[event.device_id], event.start_ns, event.end_ns)
@@ -82,8 +169,8 @@ def build_communication_chains(
             comm = comm_by_id.get(event.event_id)
             if comm is None:
                 continue
-            previous = ordered[index - 1] if index > 0 and ordered[index - 1].category != "NCCL Communication" else None
-            following = ordered[index + 1] if index + 1 < len(ordered) and ordered[index + 1].category != "NCCL Communication" else None
+            previous = ordered[index - 1] if index > 0 and not classify_kernel(ordered[index - 1].name).runtime_communication else None
+            following = ordered[index + 1] if index + 1 < len(ordered) and not classify_kernel(ordered[index + 1].name).runtime_communication else None
             if previous:
                 aggregate[("Compute→Communication", comm.device_id, comm.phase, comm.module, previous.family, comm.family, "N/A")] += 1
             if following:
@@ -162,3 +249,16 @@ def write_communication_analysis(
             tuple(record_type.__dataclass_fields__),
             [row.__dict__ for row in rows],
         )
+    summaries = summarize_communication(communication)
+    summary_fields = (
+        "device_id", "provider", "collective", "count", "total_duration_ns",
+        "average_ns", "p50_ns", "p95_ns", "compute_overlap_ns",
+        "exposed_communication_ns", "exposed_ratio",
+    )
+    write_csv(output_dir / "communication_summary.csv", summary_fields, summaries)
+    skew = summarize_arrival_skew(communication)
+    skew_fields = (
+        "collective", "occurrence", "device_count", "earliest_start_ns",
+        "latest_start_ns", "arrival_skew_ns", "evidence", "confidence",
+    )
+    write_csv(output_dir / "communication_arrival_skew.csv", skew_fields, skew)

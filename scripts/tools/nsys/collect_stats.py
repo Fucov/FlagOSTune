@@ -18,9 +18,8 @@ class CoreReportError(RuntimeError):
 CORE_REPORT = "cuda_gpu_kern_sum"
 BASE_REPORTS = (
     CORE_REPORT,
-    "cuda_gpu_kern_sum:base",
     "cuda_gpu_kern_gb_sum",
-    "cuda_kern_exec_sum:base",
+    "cuda_kern_exec_sum",
     "cuda_api_sum",
     "nvtx_sum",
     "nvtx_gpu_proj_sum",
@@ -28,17 +27,30 @@ BASE_REPORTS = (
     "cuda_gpu_mem_size_sum",
 )
 TRACE_REPORTS = (
-    "cuda_gpu_trace:base",
-    "cuda_kern_exec_trace:base",
-    "nvtx_kern_sum:base",
+    "cuda_gpu_trace",
+    "cuda_kern_exec_trace",
+    "nvtx_kern_sum",
     "nvtx_gpu_proj_trace",
 )
 KNOWN_REPORTS = BASE_REPORTS + TRACE_REPORTS
 
+REPORT_FALLBACKS = {
+    "cuda_gpu_trace": ("cuda_gpu_trace:nvtx-name", "cuda_gpu_trace"),
+    "cuda_kern_exec_trace": (
+        "cuda_kern_exec_trace:nvtx-name",
+        "cuda_kern_exec_trace",
+    ),
+    "nvtx_kern_sum": ("nvtx_kern_sum",),
+}
+
+
+def report_candidates(report_name: str) -> tuple[str, ...]:
+    return REPORT_FALLBACKS.get(report_name, (report_name,))
+
 
 def parse_help_report_names(text: str) -> Set[str]:
     """Extract concrete report names while ignoring help grammar suffixes."""
-    pattern = r"\b((?:cuda|nvtx)_[a-z0-9_]+(?::(?:base|mangled))?)(?=\[|\s|,|$)"
+    pattern = r"\b((?:cuda|nvtx)_[a-z0-9_]+(?::(?:base|mangled|nvtx-name))?)(?=\[|\s|,|$)"
     return {match.lower() for match in re.findall(pattern, text, re.IGNORECASE)}
 
 
@@ -80,9 +92,9 @@ def detect_supported_reports(
     text = help_path.read_text(encoding="utf-8", errors="replace")
     supported = parse_help_report_names(text)
     degraded_help_is_valid = (
-        "The following built-in reports are available:" in text
-        and CORE_REPORT in supported
+        CORE_REPORT in supported
         and "cuda_api_sum" in supported
+        and len(supported) >= 2
     )
     if code != 0 and not degraded_help_is_valid:
         progress.finish("Detect supported reports", started, "FAILED", output_path=help_path)
@@ -120,11 +132,17 @@ def collect_reports(
     nsys_path: str,
     output_dir: Path,
     progress: ProgressReporter,
+    allow_core_fallback: bool = False,
 ) -> ReportCollection:
     output_dir.mkdir(parents=True, exist_ok=True)
     collection = ReportCollection()
     for report_name in report_names:
-        if supported_reports is not None and report_name not in supported_reports:
+        candidates = report_candidates(report_name)
+        is_supported = supported_reports is None or any(
+            candidate in supported_reports or report_name in supported_reports
+            for candidate in candidates
+        )
+        if not is_supported:
             message = f"optional Nsight report unsupported: {report_name}"
             if report_name == CORE_REPORT:
                 raise CoreReportError(message)
@@ -134,49 +152,72 @@ def collect_reports(
             continue
 
         final_path = output_dir / report_filename(report_name)
-        temporary = final_path.with_name(final_path.name + ".tmp")
-        temporary.unlink(missing_ok=True)
-        command = [
-            nsys_path,
-            "stats",
-            "--report",
-            report_name,
-            "--format",
-            "csv",
-            str(sqlite_path),
-        ]
-        stage_name = f"Generate {report_name}"
-        started = progress.begin(
-            stage_name, command=command, input_path=sqlite_path, output_path=temporary
-        )
-        code = run_streaming_command(
-            command,
-            temporary,
-            output_dir / "progress.log",
-            progress,
-            monitored_output=temporary,
-        )
-        if code != 0:
+        candidate_errors = []
+        selected = None
+        for candidate in candidates:
+            if (
+                supported_reports is not None
+                and candidate not in supported_reports
+                and report_name not in supported_reports
+            ):
+                continue
+            temporary = final_path.with_name(final_path.name + ".tmp")
             temporary.unlink(missing_ok=True)
-            message = f"Nsight report {report_name} failed with exit {code}"
-            progress.finish(stage_name, started, "FAILED", output_path=final_path)
-            if report_name == CORE_REPORT:
-                raise CoreReportError(message)
-            collection.failed[report_name] = message
-            collection.warnings.append(WarningRecord("collect_stats", message))
-            progress.warning(message)
+            command = [
+                nsys_path,
+                "stats",
+                "--report",
+                candidate,
+                "--format",
+                "csv",
+                str(sqlite_path),
+            ]
+            stage_name = f"Generate {candidate}"
+            started = progress.begin(
+                stage_name,
+                command=command,
+                input_path=sqlite_path,
+                output_path=temporary,
+            )
+            code = run_streaming_command(
+                command,
+                temporary,
+                output_dir / "progress.log",
+                progress,
+                monitored_output=temporary,
+            )
+            if code != 0:
+                temporary.unlink(missing_ok=True)
+                candidate_errors.append(f"{candidate}: exit {code}")
+                progress.finish(stage_name, started, "FAILED", output_path=final_path)
+                continue
+            if not temporary.is_file() or temporary.stat().st_size == 0:
+                temporary.unlink(missing_ok=True)
+                candidate_errors.append(f"{candidate}: no data")
+                progress.finish(stage_name, started, "WARNING", output_path=final_path)
+                continue
+            os.replace(str(temporary), str(final_path))
+            collection.successful[report_name] = final_path
+            collection.selected_sources[report_name] = candidate
+            selected = candidate
+            progress.finish(stage_name, started, output_path=final_path)
+            break
+        if selected is not None:
+            if selected != candidates[0]:
+                message = (
+                    f"Nsight report {report_name} used fallback {selected}; "
+                    + "; ".join(candidate_errors)
+                )
+                collection.warnings.append(WarningRecord("collect_stats", message))
+                progress.warning(message)
             continue
-        if not temporary.is_file() or temporary.stat().st_size == 0:
-            temporary.unlink(missing_ok=True)
-            message = f"Nsight report {report_name} produced no data"
-            progress.finish(stage_name, started, "WARNING", output_path=final_path)
-            if report_name == CORE_REPORT:
-                raise CoreReportError(message)
-            collection.empty.append(report_name)
-            collection.warnings.append(WarningRecord("collect_stats", message))
-            progress.warning(message)
-            continue
-        os.replace(str(temporary), str(final_path))
-        collection.successful[report_name] = final_path
-        progress.finish(stage_name, started, output_path=final_path)
+        message = (
+            f"Nsight report {report_name} failed: "
+            + ("; ".join(candidate_errors) or "no supported candidate")
+        )
+        if report_name == CORE_REPORT and not allow_core_fallback:
+            raise CoreReportError(message)
+        collection.failed[report_name] = message
+        collection.warnings.append(WarningRecord("collect_stats", message))
+        progress.warning(message)
     return collection

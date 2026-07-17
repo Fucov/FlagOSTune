@@ -81,7 +81,7 @@ def analyze_devices(
         tables = _tables(connection)
         table = tables.get(normalize_header("CUPTI_ACTIVITY_KIND_KERNEL"))
         if not table:
-            return [], [WarningRecord("devices", "kernel event table is unavailable")], True
+            return [], [WarningRecord("devices", "kernel event table is unavailable")], False
         columns = _columns(connection, table)
         device_col = _column(columns, "deviceId", "device")
         pid_col = _column(columns, "globalPid", "pid", "processId")
@@ -89,7 +89,7 @@ def analyze_devices(
         end_col = _column(columns, "end", "endNs")
         name_col = _column(columns, "name", "kernelName", "nameId")
         if not all((device_col, start_col, end_col, name_col)):
-            return [], [WarningRecord("devices", "kernel event table is missing required columns")], True
+            return [], [WarningRecord("devices", "kernel event table is missing required columns")], False
         selected = [device_col, pid_col or device_col, start_col, end_col, name_col]
         query = f"select {', '.join(_quote(value) for value in selected)} from {_quote(table)}"
         strings = _string_ids(connection, tables)
@@ -100,13 +100,13 @@ def analyze_devices(
             device_id = int(device)
             duration = max(0.0, float(end) - float(start))
             name = strings.get(int(raw_name), str(raw_name)) if name_is_id else str(raw_name)
-            category, _ = classify_kernel(name)
+            classification = classify_kernel(name)
             values = by_device[device_id]
             values["pids"].add(int(pid))
             values["events"] += 1
             values["time"] += duration
             values["families"][base_family(name)] += duration
-            if category == "NCCL Communication":
+            if classification.runtime_communication:
                 values["comm"] += duration
         totals = [float(value["time"]) for value in by_device.values()]
         mean = sum(totals) / len(totals) if totals else 0.0

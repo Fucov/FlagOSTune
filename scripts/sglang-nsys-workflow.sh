@@ -21,6 +21,14 @@ ANALYZE_DEPENDENCIES=false
 ANALYZE_COMMUNICATION=false
 DEPENDENCY_TRACE=false
 CAPTURE_MODE="full-offline"
+PROFILE_PHASE="full"
+PROFILE_START_STEP=0
+PROFILE_NUM_STEPS=5
+PROFILE_WARMUP_PROMPTS=2
+PROFILE_CONCURRENCY=""
+PROFILE_READY_TIMEOUT=3600
+CUDA_GRAPH_TRACE="node"
+LAYERWISE_NVTX="auto"
 
 log_info() { printf '[INFO] %s\n' "$1"; }
 log_error() { printf '[ERROR] %s\n' "$1" >&2; }
@@ -35,7 +43,15 @@ usage() {
   --nsys                启用独立 Nsight Systems profiling（必需）
   --nsys-output PREFIX  输出文件名前缀或路径，可带 .nsys-rep 后缀
   --scenario TYPE       optimized|full|shape，默认 optimized
-  --capture-mode MODE   full-offline（server-steps 尚未实现）
+  --capture-mode MODE   full-offline|server-steps，默认 full-offline
+  --profile-phase PHASE startup|prefill|decode|full，默认 full
+  --profile-start-step N profile gate 起始 step，默认 0
+  --profile-num-steps N 采集 scheduler step 数，默认 5
+  --profile-warmup-prompts N capture 外 warmup prompt 数，默认 2
+  --profile-concurrency N server-steps benchmark 并发数（默认取场景配置）
+  --profile-ready-timeout N server readiness/decode 超时秒数，默认 3600
+  --cuda-graph-trace M graph|node|none，默认 node
+  --layerwise-nvtx M   auto|true|false，默认 auto
   --parse               采集成功后自动运行 parse_nsys.py
   --parse-top N         Markdown 表格行数，默认 20
   --parse-output-dir D  parser 输出目录，默认报告旁的 summary/
@@ -85,6 +101,46 @@ parse_args() {
             --capture-mode)
                 require_value "$1" "${2-}"
                 CAPTURE_MODE="$2"
+                shift 2
+                ;;
+            --profile-phase)
+                require_value "$1" "${2-}"
+                PROFILE_PHASE="$2"
+                shift 2
+                ;;
+            --profile-start-step)
+                require_value "$1" "${2-}"
+                PROFILE_START_STEP="$2"
+                shift 2
+                ;;
+            --profile-num-steps)
+                require_value "$1" "${2-}"
+                PROFILE_NUM_STEPS="$2"
+                shift 2
+                ;;
+            --profile-warmup-prompts)
+                require_value "$1" "${2-}"
+                PROFILE_WARMUP_PROMPTS="$2"
+                shift 2
+                ;;
+            --profile-concurrency)
+                require_value "$1" "${2-}"
+                PROFILE_CONCURRENCY="$2"
+                shift 2
+                ;;
+            --profile-ready-timeout)
+                require_value "$1" "${2-}"
+                PROFILE_READY_TIMEOUT="$2"
+                shift 2
+                ;;
+            --cuda-graph-trace)
+                require_value "$1" "${2-}"
+                CUDA_GRAPH_TRACE="$2"
+                shift 2
+                ;;
+            --layerwise-nvtx)
+                require_value "$1" "${2-}"
+                LAYERWISE_NVTX="$2"
                 shift 2
                 ;;
             --parse)
@@ -201,6 +257,40 @@ split_extra_args() {
     done
 }
 
+extra_arg_value() {
+    local option="$1"
+    shift
+    local index token
+    for ((index = 1; index <= $#; index++)); do
+        token="${!index}"
+        if [[ "$token" == "$option" && $index -lt $# ]]; then
+            index=$((index + 1))
+            printf '%s' "${!index}"
+            return 0
+        fi
+        if [[ "$token" == "${option}="* ]]; then
+            printf '%s' "${token#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+extra_args_disable_cuda_graph() {
+    local token
+    for token in "$@"; do
+        case "$token" in
+            --disable-cuda-graph|--cuda-graph-backend-decode=disabled|--cuda-graph-backend-prefill=disabled)
+                return 0
+                ;;
+        esac
+    done
+    local decode_backend prefill_backend
+    decode_backend=$(extra_arg_value --cuda-graph-backend-decode "$@" || true)
+    prefill_backend=$(extra_arg_value --cuda-graph-backend-prefill "$@" || true)
+    [[ "$decode_backend" == "disabled" || "$prefill_backend" == "disabled" ]]
+}
+
 print_command() {
     local label="$1"
     shift
@@ -248,23 +338,44 @@ write_capture_metadata() {
     local nsys_log="$9"
     shift 9
     local visible_devices="${CUDA_VISIBLE_DEVICES:-}"
-    local git_commit
+    local git_commit nsys_version
     git_commit=$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || true)
+    nsys_version=$(nsys --version 2>&1 || true)
     "$PYTHON_EXECUTABLE" - \
         "$metadata_path" "$report_path" "$model_name" "$model_path" \
         "$scenario_name" "$dataset_name" "$tensor_parallel" "$visible_devices" \
-        "$CONFIG_FILE" "$output_prefix" "$nsys_log" "$CAPTURE_MODE" "full" \
-        "$git_commit" "$@" <<'PY'
+        "$CONFIG_FILE" "$output_prefix" "$nsys_log" "$CAPTURE_MODE" \
+        "$git_commit" "$PROJECT_ROOT" "${SCRIPT_DIR}/sglang-nsys-workflow.sh" \
+        "${SCRIPT_DIR}/tools/parse_nsys.py" "$nsys_version" \
+        "${CAPTURE_START_WALL:-}" "${CAPTURE_END_WALL:-}" \
+        "${CAPTURE_DURATION_SECONDS:-}" "$PROFILE_PHASE" "$@" <<'PY'
+import hashlib
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 
 (
     metadata_path, report_path, model_name, model_path, scenario, workload,
     tp_size, visible_devices, config_path, output_prefix, nsys_log,
-    capture_mode, profile_phase, git_commit,
-) = sys.argv[1:15]
+    capture_mode, git_commit, project_root, workflow_script, parser_script,
+    nsys_version, capture_start_wall, capture_end_wall, capture_duration,
+    requested_phase,
+) = sys.argv[1:22]
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+dirty = subprocess.run(
+    ["git", "-C", project_root, "status", "--porcelain"],
+    capture_output=True,
+    text=True,
+).stdout.strip()
 value = {
     "input_report": report_path,
     "model": model_name,
@@ -277,9 +388,22 @@ value = {
     "output_prefix": output_prefix,
     "nsys_log": nsys_log,
     "capture_mode": capture_mode,
-    "profile_phase": profile_phase,
+    "capture_scope": "startup_and_full_process",
+    "profile_phase": "full_process",
+    "requested_phase": requested_phase,
+    "steady_state_guaranteed": False,
     "git_commit": git_commit or None,
-    "command": sys.argv[15:],
+    "git_dirty": bool(dirty),
+    "workflow_sha256": sha256(workflow_script),
+    "parser_sha256": sha256(parser_script),
+    "nsys_version": nsys_version or None,
+    "capture_start_wall_time": capture_start_wall or None,
+    "capture_end_wall_time": capture_end_wall or None,
+    "capture_duration_seconds": float(capture_duration) if capture_duration else None,
+    "benchmark_start_wall_time": capture_start_wall or None,
+    "benchmark_end_wall_time": capture_end_wall or None,
+    "benchmark_duration_seconds": float(capture_duration) if capture_duration else None,
+    "command": sys.argv[22:],
     "generated_time": datetime.now(timezone.utc).astimezone().isoformat(),
 }
 temporary = metadata_path + ".tmp"
@@ -360,14 +484,19 @@ run_scenario() {
     local quantization="${14}"
     local load_format="${15}"
     local extra_args="${16}"
-    local base scenario_name input_len output_len num_prompts
-    local output_prefix expected_report nsys_log metadata_path report_size nsys_status
+    local base scenario_name input_len output_len num_prompts scenario_concurrency profile_concurrency
+    local host port configured_port graph_disabled layerwise_enabled
+    local output_prefix expected_report nsys_log server_log benchmark_log metadata_path report_size nsys_status
 
     base=".benchmark.scenarios.${SCENARIO_TYPE}[${index}]"
     scenario_name=$(yq_read "${base}.name // \"scenario-$((index + 1))\"")
     input_len=$(yq_read "${base}.input_len // 4096")
     output_len=$(yq_read "${base}.output_len // 1024")
     num_prompts=$(yq_read "${base}.num_prompts // ${base}.concurrency // 1")
+    scenario_concurrency=$(yq_read "${base}.concurrency // 1")
+    profile_concurrency="${PROFILE_CONCURRENCY:-$scenario_concurrency}"
+    host=$(empty_if_null "$(yq_read '.benchmark.host // "127.0.0.1"')")
+    port=$(yq_read '.benchmark.port // .benchmark.port_base // 30000')
 
     sglang_args=(
         --model-path "$model_path"
@@ -405,22 +534,156 @@ run_scenario() {
 
     output_prefix=$(resolve_output_prefix "$model_name" "$scenario_name" "$scenario_count" "$timestamp")
     expected_report="${output_prefix}.nsys-rep"
-    cmd=(
-        nsys profile
-        --trace-fork-before-exec=true
-        --trace=cuda,nvtx,osrt
-        --sample=none
-        --cpuctxsw=none
-        --capture-range=cudaProfilerApi
-        --capture-range-end=stop
-        --force-overwrite=true
-        --output "$output_prefix"
-        "$PYTHON_EXECUTABLE" "${SCRIPT_DIR}/tools/cuda_profiler_launcher.py"
-        --module sglang.bench_offline_throughput --
-        "${sglang_args[@]}"
-    )
-    if [[ "$DEPENDENCY_TRACE" == "true" ]]; then
-        cmd=("${cmd[@]:0:8}" --cuda-event-trace=true "${cmd[@]:8}")
+    nsys_log="${output_prefix}.nsys.log"
+    server_log="${output_prefix}.server.log"
+    benchmark_log="${output_prefix}.benchmark.log"
+    metadata_path="${expected_report}.metadata.json"
+    if [[ "$CAPTURE_MODE" == "full-offline" ]]; then
+        cmd=(
+            nsys profile
+            --trace-fork-before-exec=true
+            --trace=cuda,nvtx,osrt
+            --sample=none
+            --cpuctxsw=none
+            --capture-range=cudaProfilerApi
+            --capture-range-end=stop
+            --force-overwrite=true
+            --output "$output_prefix"
+            "$PYTHON_EXECUTABLE" "${SCRIPT_DIR}/tools/cuda_profiler_launcher.py"
+            --module sglang.bench_offline_throughput --
+            "${sglang_args[@]}"
+        )
+        if [[ "$DEPENDENCY_TRACE" == "true" ]]; then
+            cmd=("${cmd[@]:0:8}" --cuda-event-trace=true "${cmd[@]:8}")
+        fi
+    else
+        configured_port=$(extra_arg_value --port "${extra_tokens[@]}" || true)
+        if [[ -n "$configured_port" ]]; then
+            port="$configured_port"
+        fi
+        server_args=(
+            --model-path "$model_path"
+            --tokenizer-path "$tokenizer_path"
+            --tp-size "$tensor_parallel"
+            --host "$host"
+        )
+        if [[ -z "$configured_port" ]]; then
+            server_args+=(--port "$port")
+        fi
+        if [[ "$trust_remote_code" == "true" ]]; then
+            server_args+=(--trust-remote-code)
+        fi
+        [[ -n "$mem_fraction" ]] && server_args+=(--mem-fraction-static "$mem_fraction")
+        [[ -n "$context_length" ]] && server_args+=(--context-length "$context_length")
+        [[ -n "$dtype" ]] && server_args+=(--dtype "$dtype")
+        [[ -n "$quantization" ]] && server_args+=(--quantization "$quantization")
+        [[ -n "$load_format" ]] && server_args+=(--load-format "$load_format")
+        server_args+=("${extra_tokens[@]}")
+
+        graph_disabled=false
+        if extra_args_disable_cuda_graph "${extra_tokens[@]}"; then
+            graph_disabled=true
+        fi
+        layerwise_enabled=false
+        case "$LAYERWISE_NVTX" in
+            true) layerwise_enabled=true ;;
+            auto)
+                if [[ "$graph_disabled" == "true" ]]; then
+                    layerwise_enabled=true
+                else
+                    log_info "CUDA Graph enabled: layerwise NVTX auto mode is disabled"
+                fi
+                ;;
+        esac
+        if [[ "$layerwise_enabled" == "true" ]]; then
+            server_args+=(--enable-layerwise-nvtx-marker)
+            if [[ "$graph_disabled" != "true" ]]; then
+                log_info "WARNING: layerwise NVTX was forced while CUDA Graph is enabled"
+            fi
+        fi
+
+        client_common=(
+            --backend sglang
+            --host "$host"
+            --port "$port"
+            --model "$model_path"
+            --tokenizer "$tokenizer_path"
+            --dataset-name "$dataset_name"
+        )
+        if [[ -n "$dataset_path" ]]; then
+            client_common+=(--dataset-path "$dataset_path")
+        fi
+        if [[ "$dataset_name" == "random" ]]; then
+            client_common+=(--random-input-len "$input_len" --random-output-len "$output_len")
+        else
+            client_common+=(--sharegpt-output-len "$output_len")
+        fi
+        warmup_cmd=(
+            "$PYTHON_EXECUTABLE" -m sglang.bench_serving
+            "${client_common[@]}"
+            --num-prompts "$PROFILE_WARMUP_PROMPTS"
+            --max-concurrency "$profile_concurrency"
+        )
+        benchmark_cmd=(
+            "$PYTHON_EXECUTABLE" -m sglang.bench_serving
+            "${client_common[@]}"
+            --num-prompts "$num_prompts"
+            --max-concurrency "$profile_concurrency"
+        )
+        nsys_cmd=(
+            nsys profile
+            --trace-fork-before-exec=true
+            --trace=cuda,nvtx,osrt
+            --sample=none
+            --cpuctxsw=none
+            --capture-range=cudaProfilerApi
+            --capture-range-end=stop
+            "--cuda-graph-trace=${CUDA_GRAPH_TRACE}"
+            --force-overwrite=true
+            --output "$output_prefix"
+            "$PYTHON_EXECUTABLE" "${SCRIPT_DIR}/tools/sglang_server_steps.py"
+            exec-server --log "$server_log" --
+            "$PYTHON_EXECUTABLE" -m sglang.launch_server
+            "${server_args[@]}"
+        )
+        if [[ "$DEPENDENCY_TRACE" == "true" ]]; then
+            nsys_cmd=("${nsys_cmd[@]:0:8}" --cuda-event-trace=true "${nsys_cmd[@]:8}")
+        fi
+        cmd=(
+            "$PYTHON_EXECUTABLE" "${SCRIPT_DIR}/tools/sglang_server_steps.py" run
+            --output-prefix "$output_prefix"
+            --report "$expected_report"
+            --metadata "$metadata_path"
+            --server-log "$server_log"
+            --nsys-log "$nsys_log"
+            --benchmark-log "$benchmark_log"
+            --base-url "http://${host}:${port}"
+            --profile-phase "$PROFILE_PHASE"
+            --profile-start-step "$PROFILE_START_STEP"
+            --profile-num-steps "$PROFILE_NUM_STEPS"
+            --profile-warmup-prompts "$PROFILE_WARMUP_PROMPTS"
+            --profile-concurrency "$profile_concurrency"
+            --profile-ready-timeout "$PROFILE_READY_TIMEOUT"
+            --decode-log-pattern 'Decode batch.*running[^0-9]*[1-9][0-9]*'
+            --cuda-graph-enabled "$([[ "$graph_disabled" == "true" ]] && printf false || printf true)"
+            --cuda-graph-trace "$CUDA_GRAPH_TRACE"
+            --layerwise-nvtx-enabled "$layerwise_enabled"
+            --project-root "$PROJECT_ROOT"
+            --workflow-script "${SCRIPT_DIR}/sglang-nsys-workflow.sh"
+            --parser-script "${SCRIPT_DIR}/tools/parse_nsys.py"
+            --model "$model_name"
+            --model-path "$model_path"
+            --tokenizer-path "$tokenizer_path"
+            --scenario "$scenario_name"
+            --dataset "$dataset_name"
+            --num-prompts "$num_prompts"
+            --input-tokens "$input_len"
+            --output-tokens "$output_len"
+            --tp-size "$tensor_parallel"
+            --nsys-command "${nsys_cmd[@]}"
+            --warmup-command "${warmup_cmd[@]}"
+            --benchmark-command "${benchmark_cmd[@]}"
+        )
     fi
 
     log_info "场景: ${scenario_name}"
@@ -429,8 +692,6 @@ run_scenario() {
     log_info "设备: CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<not-set>}"
     log_info "TP size: ${tensor_parallel}"
     log_info "Nsight 输出: ${expected_report}"
-    nsys_log="${output_prefix}.nsys.log"
-    metadata_path="${expected_report}.metadata.json"
     log_info "Nsight 日志: ${nsys_log}"
     build_parse_command "$expected_report"
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -444,10 +705,15 @@ run_scenario() {
     mkdir -p "$(dirname "$output_prefix")"
     : > "$nsys_log"
     print_command "[COMMAND]" "${cmd[@]}" | tee -a "$nsys_log"
+    CAPTURE_START_WALL=$("$PYTHON_EXECUTABLE" -c 'from datetime import datetime; print(datetime.now().astimezone().isoformat())')
+    CAPTURE_START_SECONDS=$("$PYTHON_EXECUTABLE" -c 'import time; print(time.time())')
     set +e
     "${cmd[@]}" 2>&1 | tee -a "$nsys_log"
     nsys_status=${PIPESTATUS[0]}
     set -e
+    CAPTURE_END_WALL=$("$PYTHON_EXECUTABLE" -c 'from datetime import datetime; print(datetime.now().astimezone().isoformat())')
+    CAPTURE_END_SECONDS=$("$PYTHON_EXECUTABLE" -c 'import time; print(time.time())')
+    CAPTURE_DURATION_SECONDS=$("$PYTHON_EXECUTABLE" -c 'import sys; print(max(0.0, float(sys.argv[2]) - float(sys.argv[1])))' "$CAPTURE_START_SECONDS" "$CAPTURE_END_SECONDS")
     if [[ "$nsys_status" -ne 0 ]]; then
         log_error "nsys profile 失败，退出码 ${nsys_status}；日志: ${nsys_log}"
         return "$nsys_status"
@@ -457,11 +723,20 @@ run_scenario() {
         exit 1
     fi
     report_size=$(wc -c < "$expected_report" | tr -d '[:space:]')
+    if [[ ! "$report_size" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "nsys 报告为空: ${expected_report}"
+        exit 1
+    fi
     log_info "Report size: ${report_size} bytes (${expected_report})"
-    write_capture_metadata \
-        "$metadata_path" "$expected_report" "$model_name" "$model_path" \
-        "$scenario_name" "$dataset_name" "$tensor_parallel" "$output_prefix" \
-        "$nsys_log" "${cmd[@]}"
+    if [[ "$CAPTURE_MODE" == "full-offline" ]]; then
+        write_capture_metadata \
+            "$metadata_path" "$expected_report" "$model_name" "$model_path" \
+            "$scenario_name" "$dataset_name" "$tensor_parallel" "$output_prefix" \
+            "$nsys_log" "${cmd[@]}"
+    elif [[ ! -s "$metadata_path" ]]; then
+        log_error "server-steps 完成但缺少成功 metadata: ${metadata_path}"
+        exit 1
+    fi
     log_info "采集元数据: ${metadata_path}"
     if [[ "$PARSE_REPORT" == "true" ]]; then
         print_command "[PARSE COMMAND]" "${parse_cmd[@]}"
@@ -475,12 +750,54 @@ main() {
         log_error "必须指定 --nsys 才会启动 Nsight Systems profiling"
         exit 2
     fi
-    if [[ "$CAPTURE_MODE" == "server-steps" ]]; then
-        log_error "--capture-mode server-steps is deferred; 当前版本只实现 full-offline"
+    case "$CAPTURE_MODE" in
+        full-offline|server-steps) ;;
+        *)
+            log_error "--capture-mode 仅支持 full-offline|server-steps，当前值: ${CAPTURE_MODE}"
+            exit 2
+            ;;
+    esac
+    case "$PROFILE_PHASE" in
+        startup|prefill|decode|full) ;;
+        *)
+            log_error "--profile-phase 仅支持 startup|prefill|decode|full，当前值: ${PROFILE_PHASE}"
+            exit 2
+            ;;
+    esac
+    if [[ "$CAPTURE_MODE" == "full-offline" && "$PROFILE_PHASE" != "full" && "$PROFILE_PHASE" != "startup" ]]; then
+        log_error "full-offline 始终是 startup/full_process capture，不能标注为 ${PROFILE_PHASE}；请使用 --capture-mode server-steps"
         exit 2
     fi
-    if [[ "$CAPTURE_MODE" != "full-offline" ]]; then
-        log_error "--capture-mode 仅支持 full-offline，当前值: ${CAPTURE_MODE}"
+    if [[ "$CAPTURE_MODE" == "server-steps" && "$PROFILE_PHASE" == "startup" ]]; then
+        log_error "server-steps 必须等待 HTTP readiness，不能代表模型 startup；请使用 --capture-mode full-offline --profile-phase startup"
+        exit 2
+    fi
+    case "$CUDA_GRAPH_TRACE" in
+        graph|node|none) ;;
+        *)
+            log_error "--cuda-graph-trace 仅支持 graph|node|none，当前值: ${CUDA_GRAPH_TRACE}"
+            exit 2
+            ;;
+    esac
+    case "$LAYERWISE_NVTX" in
+        auto|true|false) ;;
+        *)
+            log_error "--layerwise-nvtx 仅支持 auto|true|false，当前值: ${LAYERWISE_NVTX}"
+            exit 2
+            ;;
+    esac
+    if [[ ! "$PROFILE_START_STEP" =~ ^[0-9]+$ ]]; then
+        log_error "--profile-start-step 必须是非负整数"
+        exit 2
+    fi
+    for profile_value in PROFILE_NUM_STEPS PROFILE_WARMUP_PROMPTS PROFILE_READY_TIMEOUT; do
+        if [[ ! "${!profile_value}" =~ ^[1-9][0-9]*$ ]]; then
+            log_error "--$(printf '%s' "$profile_value" | tr '[:upper:]_' '[:lower:]-') 必须是正整数"
+            exit 2
+        fi
+    done
+    if [[ -n "$PROFILE_CONCURRENCY" && ! "$PROFILE_CONCURRENCY" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "--profile-concurrency 必须是正整数"
         exit 2
     fi
     if [[ ! "$PARSE_TOP" =~ ^[1-9][0-9]*$ ]]; then

@@ -6,6 +6,8 @@ from scripts.tools.nsys.analyze_communication import (
     analyze_communication,
     build_communication_chains,
     build_fusion_candidates,
+    summarize_communication,
+    summarize_arrival_skew,
     write_communication_analysis,
 )
 from scripts.tools.nsys.analyze_dependencies import build_adjacency
@@ -13,6 +15,36 @@ from scripts.tools.nsys.models import KernelEvent
 
 
 class NsysCommunicationAnalysisTest(unittest.TestCase):
+    def event(self, event_id, device, stream, start, end, name):
+        return KernelEvent(event_id, device, 1, stream, start, end, name)
+
+    def test_collective_summary_has_provider_percentiles_and_exposed_ratio(self):
+        events = [
+            self.event(1, 0, 1, 0, 10, "ncclDevKernel_AllReduce"),
+            self.event(2, 0, 1, 20, 50, "ncclDevKernel_AllReduce"),
+            self.event(3, 0, 1, 60, 80, "all_reduce_two_shot_kernel"),
+        ]
+        communication = analyze_communication(events)
+        summary = summarize_communication(communication)
+        nccl = next(row for row in summary if row["provider"] == "NCCL")
+        custom = next(row for row in summary if row["provider"] == "Custom")
+        self.assertEqual(nccl["count"], 2)
+        self.assertEqual(nccl["average_ns"], 20.0)
+        self.assertEqual(nccl["p50_ns"], 20.0)
+        self.assertEqual(nccl["p95_ns"], 29.0)
+        self.assertEqual(custom["collective"], "Custom AllReduce")
+        self.assertGreaterEqual(nccl["exposed_ratio"], 0.0)
+
+    def test_arrival_skew_requires_matching_per_device_occurrences(self):
+        events = [
+            self.event(1, 0, 1, 10, 20, "ncclDevKernel_AllReduce"),
+            self.event(2, 1, 1, 15, 25, "ncclDevKernel_AllReduce"),
+            self.event(3, 0, 1, 30, 40, "ncclDevKernel_AllReduce"),
+            self.event(4, 1, 1, 38, 48, "ncclDevKernel_AllReduce"),
+        ]
+        skew = summarize_arrival_skew(analyze_communication(events))
+        self.assertEqual([row["arrival_skew_ns"] for row in skew], [5, 8])
+        self.assertTrue(all(row["confidence"] == "MEDIUM" for row in skew))
     def setUp(self):
         self.compute_before = KernelEvent(1, 0, 1, 7, 0, 100, "gemm_a", "Dense GEMM", "gemm", "PREFILL", "layer.0")
         self.communication = KernelEvent(2, 0, 1, 7, 110, 210, "ncclAllReduce", "NCCL Communication", "allreduce", "PREFILL", "layer.0")
