@@ -2,7 +2,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.tools.nsys.classify_kernels import classify_kernel, classify_kernels, write_classification
+from scripts.tools.nsys.classify_kernels import (
+    build_operator_hotspots,
+    classify_kernel,
+    classify_kernels,
+    write_classification,
+)
 from scripts.tools.nsys.models import KernelSummary
 
 
@@ -62,6 +67,30 @@ class NsysKernelAnalysisTest(unittest.TestCase):
 
         self.assertIn("base_family,category,classification_rule", classification)
         self.assertIn("mystery", unknown)
+
+    def test_operator_hotspots_merge_variants_and_judge_comm_compute_fusion(self):
+        rows = [
+            self.row("fused_allreduce_rmsnorm_kernel_128", 70, 7),
+            self.row("fused_allreduce_rmsnorm_kernel_256", 30, 3),
+            self.row("plain_gemm", 80, 4),
+            self.row("ncclDevKernel_AllReduce_RING_LL", 20, 2),
+            self.row("mystery_xyz", 10, 1),
+        ]
+
+        hotspots = build_operator_hotspots(rows)
+
+        self.assertEqual(hotspots[0].base_family, "fused_allreduce_rmsnorm_kernel_N")
+        self.assertEqual(hotspots[0].total_ns, 100)
+        self.assertEqual(hotspots[0].instances, 10)
+        self.assertEqual(hotspots[0].fusion_verdict, "YES")
+        self.assertEqual(hotspots[0].fusion_type, "communication-compute")
+        by_name = {row.base_family: row for row in hotspots}
+        self.assertEqual(by_name["plain_gemm"].fusion_verdict, "NO")
+        self.assertEqual(
+            by_name["ncclDevKernel_AllReduce_RING_LL"].fusion_type,
+            "standalone-communication",
+        )
+        self.assertEqual(by_name["mystery_xyz"].fusion_verdict, "UNKNOWN")
 
 
 if __name__ == "__main__":

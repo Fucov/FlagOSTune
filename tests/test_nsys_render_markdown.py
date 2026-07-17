@@ -5,6 +5,7 @@ from pathlib import Path
 from scripts.tools.nsys.analyze_phases import attribute_phase
 from scripts.tools.nsys.models import (
     AnalysisData,
+    ClassifiedKernel,
     DeviceSummary,
     KernelSummary,
     ReportCollection,
@@ -47,6 +48,21 @@ class NsysRenderMarkdownTest(unittest.TestCase):
             reports=reports,
             kernels=[KernelSummary("complete_kernel_name", 1000, 5, 100.0, 200)],
             base_kernels=[KernelSummary("base_family", 1000, 5, 100.0, 200)],
+            operator_hotspots=[
+                ClassifiedKernel(
+                    "fused_allreduce_rmsnorm_kernel",
+                    "fused_allreduce_rmsnorm_kernel",
+                    "Fused Communication-Compute",
+                    "explicit fused communication and normalization tokens",
+                    "HIGH",
+                    1000,
+                    5,
+                    100.0,
+                    "YES",
+                    "communication-compute",
+                    "one kernel contains allreduce + rmsnorm + fused",
+                )
+            ],
             devices=[DeviceSummary(0, 1, 5, 1000, 800, 200, 20.0, "base_family", 1.0, 0.0, "GPU-0")],
             native_tables={
                 "cuda_gpu_kern_gb_sum": [{"Grid XYZ": "1 2 3", "Block XYZ": "128 1 1"}],
@@ -66,6 +82,10 @@ class NsysRenderMarkdownTest(unittest.TestCase):
         positions = [markdown.index(title) for title in SECTION_TITLES]
         self.assertEqual(positions, sorted(positions))
         self.assertIn("complete_kernel_name", markdown)
+        self.assertIn("Full-Inference Operator Hotspots", markdown)
+        self.assertIn("fused_allreduce_rmsnorm_kernel", markdown)
+        self.assertIn("communication-compute", markdown)
+        self.assertIn("YES", markdown)
         self.assertIn("Kernel instances | 5", markdown)
         self.assertIn("GPU-0", markdown)
         self.assertIn("NVTX data is empty", markdown)

@@ -27,9 +27,11 @@ from scripts.tools.nsys.analyze_dependencies import build_adjacency, load_trace_
 from scripts.tools.nsys.analyze_devices import analyze_devices, write_device_summary
 from scripts.tools.nsys.analyze_phases import attribute_phase
 from scripts.tools.nsys.classify_kernels import (
+    build_operator_hotspots,
     classify_kernel,
     classify_kernels,
     write_classification,
+    write_operator_hotspots,
 )
 from scripts.tools.nsys.collect_stats import (
     CoreReportError,
@@ -329,8 +331,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         base_path = collection.successful.get("cuda_gpu_kern_sum_base")
         base_kernels = load_kernel_summary(base_path) if base_path else kernels
         classified = classify_kernels(kernels)
+        operator_hotspots = build_operator_hotspots(kernels)
         write_classification(classified, output_dir)
-        progress.finish("Normalize and classify kernel reports", started, output_path=output_dir / "kernel_classification.csv")
+        write_operator_hotspots(operator_hotspots, output_dir)
+        progress.finish("Normalize and classify kernel reports", started, output_path=output_dir / "operator_hotspots.csv")
 
         expected_tp = capture.get("tp_size") or capture.get("tensor_parallel_size")
         expected_tp = int(expected_tp) if expected_tp not in (None, "", "null") else None
@@ -483,6 +487,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             reports=collection,
             kernels=kernels,
             base_kernels=base_kernels,
+            operator_hotspots=operator_hotspots,
             classified=classified,
             devices=devices,
             adjacency=adjacency,

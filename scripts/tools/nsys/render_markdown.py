@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 
-from .models import AnalysisData, KernelSummary
+from .models import AnalysisData, ClassifiedKernel, KernelSummary
 from .utils import atomic_write_text, format_bytes
 
 
@@ -15,7 +15,7 @@ SECTION_NAMES = (
     "Experiment Environment",
     "Workload and Benchmark",
     "Data Integrity",
-    "Top Kernel Families",
+    "Full-Inference Operator Hotspots",
     "Top Kernel Variants",
     "Kernel Classification",
     "Multi-GPU and TP Rank",
@@ -62,6 +62,26 @@ def _kernel_table(rows: Sequence[KernelSummary], top: int) -> str:
                 "Instances": row.instances,
                 "Avg (us)": f"{row.avg_ns / 1_000:.3f}" if row.avg_ns is not None else "N/A",
                 "Name": row.name,
+            }
+        )
+    return _mapping_table(values, top)
+
+
+def _operator_hotspot_table(rows: Sequence[ClassifiedKernel], top: int) -> str:
+    values = []
+    for rank, row in enumerate(rows[:top], 1):
+        values.append(
+            {
+                "Rank": rank,
+                "Operator / Kernel Family": row.base_family,
+                "Category": row.category,
+                "Total (ms)": f"{row.total_ns / 1_000_000:.3f}",
+                "Calls": row.instances,
+                "Overall (%)": f"{row.time_percentage:.2f}",
+                "Comm-Compute Fusion": row.fusion_verdict,
+                "Fusion Type": row.fusion_type,
+                "Evidence": row.fusion_evidence,
+                "Confidence": row.classification_confidence,
             }
         )
     return _mapping_table(values, top)
@@ -126,7 +146,7 @@ def render_markdown(
         SECTION_TITLES[2],
         "\n".join(
             f"- {key}: `{_escape(metadata.get(key))}`"
-            for key in ("model", "scenario", "workload", "tp_size", "visible_devices", "capture_mode", "profile_phase")
+            for key in ("model", "scenario", "workload", "tp_size", "visible_devices", "capture_mode", "inference_scope")
         ),
         SECTION_TITLES[3],
         (
@@ -135,7 +155,14 @@ def render_markdown(
             f"Completeness reasons: `{integrity_reasons}`.\n\nWarnings:\n{warnings}"
         ),
         SECTION_TITLES[4],
-        f"Top {top} base kernel families:\n\n{_kernel_table(data.base_kernels, top)}\n\nKernel grid/block summary (launch-shape proxy):\n\n{_native(data, 'cuda_gpu_kern_gb_sum', top)}",
+        (
+            "All measured prefill and decode kernels are aggregated into one ranking. "
+            "Times are summed across captured GPUs and are not wall-clock latency. "
+            "`YES` requires explicit evidence inside one kernel; adjacency/overlap is only a candidate.\n\n"
+            f"{_operator_hotspot_table(data.operator_hotspots, top)}\n\n"
+            "Kernel grid/block summary (launch-shape proxy):\n\n"
+            f"{_native(data, 'cuda_gpu_kern_gb_sum', top)}"
+        ),
         SECTION_TITLES[5],
         f"Top {top} complete CUDA kernel names:\n\n{_kernel_table(data.kernels, top)}",
         SECTION_TITLES[6],

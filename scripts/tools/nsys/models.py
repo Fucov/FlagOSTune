@@ -38,6 +38,9 @@ class ClassifiedKernel:
     total_ns: float
     instances: int
     time_percentage: float
+    fusion_verdict: str = "UNKNOWN"
+    fusion_type: str = "unresolved"
+    fusion_evidence: str = "insufficient kernel-name or source evidence"
 
 
 @dataclass(frozen=True)
@@ -163,6 +166,7 @@ class AnalysisData:
     reports: ReportCollection
     kernels: List[KernelSummary] = field(default_factory=list)
     base_kernels: List[KernelSummary] = field(default_factory=list)
+    operator_hotspots: List[ClassifiedKernel] = field(default_factory=list)
     classified: List[ClassifiedKernel] = field(default_factory=list)
     devices: List[DeviceSummary] = field(default_factory=list)
     adjacency: List[AdjacencyRecord] = field(default_factory=list)

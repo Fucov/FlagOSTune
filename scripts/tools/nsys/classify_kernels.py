@@ -32,11 +32,23 @@ RUNTIME_COMMUNICATION_CATEGORIES = {
     "P2P Send/Recv",
 }
 
+COMMUNICATION_EVIDENCE = re.compile(
+    r"(all[_]?reduce|all[_]?gather|reduce[_]?scatter|all[_]?to[_]?all|"
+    r"nccl|p2p|send|recv|collective)",
+    re.IGNORECASE,
+)
+COMPUTE_EVIDENCE = re.compile(
+    r"(rms.?norm|layer.?norm|gemm|matmul|mma|attention|softmax|moe|expert|"
+    r"silu|gelu|relu|activation|quant|dequant|top.?k)",
+    re.IGNORECASE,
+)
+EXPLICIT_FUSION_EVIDENCE = re.compile(r"(fused|fusion|fuse[_:]?)", re.IGNORECASE)
+
 
 def base_family(name: str) -> str:
     value = re.sub(r"<.*>", "<...>", name)
     value = re.sub(r"0x[0-9a-fA-F]+", "0x...", value)
-    value = re.sub(r"\b\d{3,}\b", "N", value)
+    value = re.sub(r"(?<![A-Za-z0-9])\d{3,}(?![A-Za-z0-9])", "N", value)
     return re.sub(r"\s+", " ", value).strip()
 
 
@@ -111,12 +123,59 @@ def classify_kernel(
     return KernelClassification("Unknown", "no classification rule matched", "LOW")
 
 
+def judge_comm_compute_fusion(
+    name: str, classification: KernelClassification
+) -> tuple[str, str, str]:
+    """Conservatively judge whether one kernel fuses communication and compute."""
+    has_communication = bool(COMMUNICATION_EVIDENCE.search(name))
+    has_compute = bool(COMPUTE_EVIDENCE.search(name))
+    has_explicit_fusion = bool(EXPLICIT_FUSION_EVIDENCE.search(name))
+    if has_communication and has_compute and has_explicit_fusion:
+        return (
+            "YES",
+            "communication-compute",
+            "single kernel name contains explicit fusion, communication, and compute evidence",
+        )
+    if has_communication and has_compute:
+        return (
+            "UNKNOWN",
+            "possible-communication-compute",
+            "communication and compute tokens coexist, but explicit fused-kernel evidence is absent",
+        )
+    if classification.runtime_communication:
+        return (
+            "NO",
+            "standalone-communication",
+            "kernel matches a standalone runtime collective rule",
+        )
+    if classification.category == "Communication Init":
+        return (
+            "NO",
+            "communication-initialization",
+            "kernel is communicator initialization, not inference compute fusion",
+        )
+    if classification.category == "Unknown":
+        return (
+            "UNKNOWN",
+            "unresolved",
+            "kernel classification is unknown; source or profiler-stack evidence is required",
+        )
+    return (
+        "NO",
+        "standalone-compute",
+        "recognized compute or memory kernel has no communication evidence",
+    )
+
+
 def classify_kernels(rows: Iterable[KernelSummary]) -> List[ClassifiedKernel]:
     materialized = list(rows)
     denominator = sum(row.total_ns for row in materialized)
     output = []
     for row in materialized:
         classification = classify_kernel(row.name)
+        fusion_verdict, fusion_type, fusion_evidence = judge_comm_compute_fusion(
+            row.name, classification
+        )
         output.append(
             ClassifiedKernel(
                 name=row.name,
@@ -127,6 +186,48 @@ def classify_kernels(rows: Iterable[KernelSummary]) -> List[ClassifiedKernel]:
                 total_ns=row.total_ns,
                 instances=row.instances,
                 time_percentage=(row.total_ns / denominator * 100.0) if denominator else 0.0,
+                fusion_verdict=fusion_verdict,
+                fusion_type=fusion_type,
+                fusion_evidence=fusion_evidence,
+            )
+        )
+    return sorted(output, key=lambda row: row.total_ns, reverse=True)
+
+
+def build_operator_hotspots(rows: Iterable[KernelSummary]) -> List[ClassifiedKernel]:
+    """Aggregate all measured prefill and decode kernels by normalized family."""
+    grouped = {}
+    for row in rows:
+        family = base_family(row.name)
+        values = grouped.setdefault(family, {"total_ns": 0.0, "instances": 0})
+        values["total_ns"] += row.total_ns
+        values["instances"] += row.instances
+    denominator = sum(values["total_ns"] for values in grouped.values())
+    output = []
+    for family, values in grouped.items():
+        classification = classify_kernel(family)
+        verdict, fusion_type, evidence = judge_comm_compute_fusion(
+            family, classification
+        )
+        output.append(
+            ClassifiedKernel(
+                name=family,
+                base_family=family,
+                category=(
+                    "Fused Communication-Compute"
+                    if verdict == "YES"
+                    else classification.category
+                ),
+                classification_rule=classification.rule,
+                classification_confidence=classification.confidence,
+                total_ns=values["total_ns"],
+                instances=values["instances"],
+                time_percentage=(
+                    values["total_ns"] / denominator * 100.0 if denominator else 0.0
+                ),
+                fusion_verdict=verdict,
+                fusion_type=fusion_type,
+                fusion_evidence=evidence,
             )
         )
     return sorted(output, key=lambda row: row.total_ns, reverse=True)
@@ -136,8 +237,24 @@ def write_classification(rows: Iterable[ClassifiedKernel], output_dir: Path) -> 
     materialized = list(rows)
     fields = (
         "name", "base_family", "category", "classification_rule",
-        "classification_confidence", "total_ns", "instances", "time_percentage"
+        "classification_confidence", "total_ns", "instances", "time_percentage",
+        "fusion_verdict", "fusion_type", "fusion_evidence",
     )
     write_csv(output_dir / "kernel_classification.csv", fields, [row.__dict__ for row in materialized])
     unknown = [row.__dict__ for row in materialized if row.category == "Unknown"]
     write_csv(output_dir / "unknown_kernels.csv", fields, unknown)
+
+
+def write_operator_hotspots(
+    rows: Iterable[ClassifiedKernel], output_dir: Path
+) -> None:
+    fields = (
+        "base_family", "category", "total_ns", "instances", "time_percentage",
+        "fusion_verdict", "fusion_type", "fusion_evidence",
+        "classification_confidence", "classification_rule",
+    )
+    write_csv(
+        output_dir / "operator_hotspots.csv",
+        fields,
+        [row.__dict__ for row in rows],
+    )

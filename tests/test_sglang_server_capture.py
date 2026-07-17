@@ -9,42 +9,42 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from scripts.tools.sglang_server_steps import (
+from scripts.tools.sglang_server_capture import (
     CaptureError,
-    DecodeDetector,
     parse_command_groups,
     profile_request_body,
     start_profile,
+    stop_profile,
     terminate_process_group,
-    wait_for_decode,
     wait_ready,
 )
 
 
-class SGLangServerStepsTest(unittest.TestCase):
+class SGLangServerCaptureTest(unittest.TestCase):
     def test_profile_request_body_uses_cuda_profiler_activity(self):
         self.assertEqual(
-            profile_request_body(7),
-            {
-                "start_step": 0,
-                "num_steps": 7,
-                "activities": ["CUDA_PROFILER"],
-            },
+            profile_request_body(),
+            {"activities": ["CUDA_PROFILER"]},
         )
 
     def test_start_profile_http_error_is_fatal(self):
         with mock.patch(
-            "scripts.tools.sglang_server_steps.http_json",
+            "scripts.tools.sglang_server_capture.http_json",
             return_value=(500, {"error": "profiler unavailable"}),
         ):
             with self.assertRaisesRegex(CaptureError, "HTTP 500"):
-                start_profile("http://127.0.0.1:30001", 4)
+                start_profile("http://127.0.0.1:30001")
 
-    def test_decode_detector_requires_decode_and_positive_running_requests(self):
-        detector = DecodeDetector()
-        self.assertFalse(detector.feed("running requests: 0"))
-        self.assertFalse(detector.feed("running request(s): 3"))
-        self.assertTrue(detector.feed("Decode batch size=3"))
+    def test_stop_profile_uses_manual_stop_endpoint(self):
+        with mock.patch(
+            "scripts.tools.sglang_server_capture.http_json",
+            return_value=(200, {"status": "ok"}),
+        ) as request:
+            result = stop_profile("http://127.0.0.1:30001")
+        self.assertEqual(result["status"], 200)
+        request.assert_called_once_with(
+            "POST", "http://127.0.0.1:30001/stop_profile", None, 10.0
+        )
 
     def test_wait_ready_falls_back_to_v1_models(self):
         calls = []
@@ -74,41 +74,16 @@ class SGLangServerStepsTest(unittest.TestCase):
                 poll_interval=0.001,
             )
 
-    def test_wait_for_decode_reads_incrementally(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            log = Path(tmp) / "server.log"
-            log.write_text("running request(s): 2\nDecode batch size=2\n", encoding="utf-8")
-            evidence = wait_for_decode(
-                log,
-                timeout=0.2,
-                child_alive=lambda: None,
-                poll_interval=0.001,
-            )
-        self.assertIn("Decode batch", evidence)
-        self.assertIn("running request", evidence)
-
-    def test_wait_for_decode_times_out_without_guessing(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            log = Path(tmp) / "server.log"
-            log.write_text("prefill batch only\n", encoding="utf-8")
-            with self.assertRaisesRegex(CaptureError, "decode evidence timeout"):
-                wait_for_decode(
-                    log,
-                    timeout=0.01,
-                    child_alive=lambda: None,
-                    poll_interval=0.001,
-                )
-
     def test_command_groups_preserve_option_like_child_arguments(self):
         prefix, groups = parse_command_groups(
             [
-                "--profile-phase", "decode",
+                "--profile-warmup-prompts", "2",
                 "--nsys-command", "nsys", "profile", "--trace=cuda",
                 "--warmup-command", "python", "-m", "warmup", "--num-prompts", "2",
                 "--benchmark-command", "python", "-m", "bench", "--num-prompts", "4",
             ]
         )
-        self.assertEqual(prefix, ["--profile-phase", "decode"])
+        self.assertEqual(prefix, ["--profile-warmup-prompts", "2"])
         self.assertEqual(groups["nsys"], ["nsys", "profile", "--trace=cuda"])
         self.assertEqual(groups["warmup"][-2:], ["--num-prompts", "2"])
         self.assertEqual(groups["benchmark"][-2:], ["--num-prompts", "4"])

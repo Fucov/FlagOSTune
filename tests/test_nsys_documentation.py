@@ -11,26 +11,29 @@ class NsysDocumentationTest(unittest.TestCase):
         required = (
             "Qwen3.6-35B-A3B-FP8-TP4-P128D16",
             "DeepSeek-V4-Flash-FP8-TP8-Profile-P2048D32C64",
-            "--capture-mode full-offline",
+            "--capture-mode server-full",
             "--parse-output-dir",
             "--force-export",
             "--analyze-dependencies",
             "progress.log",
             "export_sqlite.log",
             "cuda_gpu_kern_sum.csv",
+            "operator_hotspots.csv",
             "kernel_adjacency.csv",
             "communication_chains.csv",
             "nsys_analysis.md",
-            "server-steps",
-            "decode-only",
-            "--profile-phase prefill",
-            "--profile-phase decode",
+            "/start_profile",
+            "/stop_profile",
+            "prefill + decode",
+            "YES / NO / UNKNOWN",
             "cuda_gpu_trace:nvtx-name",
             "raw_report_integrity",
             "analysis_completeness",
         )
         for value in required:
             self.assertIn(value, text)
+        self.assertNotIn("--profile-phase", text)
+        self.assertNotIn("--profile-num-steps", text)
 
 
 if __name__ == "__main__":
