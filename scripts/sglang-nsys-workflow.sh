@@ -50,7 +50,7 @@ usage() {
   --profile-warmup-prompts N capture 外 warmup prompt 数，默认 2
   --profile-concurrency N server-steps benchmark 并发数（默认取场景配置）
   --profile-ready-timeout N server readiness/decode 超时秒数，默认 3600
-  --cuda-graph-trace M graph|node|none，默认 node
+  --cuda-graph-trace M graph|node|none，默认 node；none 表示不传该 Nsight 选项
   --layerwise-nvtx M   auto|true|false，默认 auto
   --parse               采集成功后自动运行 parse_nsys.py
   --parse-top N         Markdown 表格行数，默认 20
@@ -638,7 +638,14 @@ run_scenario() {
             --cpuctxsw=none
             --capture-range=cudaProfilerApi
             --capture-range-end=stop
-            "--cuda-graph-trace=${CUDA_GRAPH_TRACE}"
+        )
+        if [[ "$DEPENDENCY_TRACE" == "true" ]]; then
+            nsys_cmd+=(--cuda-event-trace=true)
+        fi
+        if [[ "$CUDA_GRAPH_TRACE" != "none" ]]; then
+            nsys_cmd+=("--cuda-graph-trace=${CUDA_GRAPH_TRACE}")
+        fi
+        nsys_cmd+=(
             --force-overwrite=true
             --output "$output_prefix"
             "$PYTHON_EXECUTABLE" "${SCRIPT_DIR}/tools/sglang_server_steps.py"
@@ -646,9 +653,6 @@ run_scenario() {
             "$PYTHON_EXECUTABLE" -m sglang.launch_server
             "${server_args[@]}"
         )
-        if [[ "$DEPENDENCY_TRACE" == "true" ]]; then
-            nsys_cmd=("${nsys_cmd[@]:0:8}" --cuda-event-trace=true "${nsys_cmd[@]:8}")
-        fi
         cmd=(
             "$PYTHON_EXECUTABLE" "${SCRIPT_DIR}/tools/sglang_server_steps.py" run
             --output-prefix "$output_prefix"

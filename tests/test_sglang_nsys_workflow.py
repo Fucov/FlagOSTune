@@ -455,6 +455,31 @@ class SGLangNsysWorkflowTest(unittest.TestCase):
         self.assertIn("--decode-log-pattern", result.stdout)
         self.assertNotIn("sleep-before-profile", result.stdout)
 
+    def test_cuda_graph_trace_none_omits_unsupported_nsys_option(self):
+        suffix = self.write_config(
+            make_config(
+                "Qwen3.6-35B-A3B-FP8-TP4-Test",
+                "/models/Qwen3.6-35B-A3B-FP8",
+                4,
+            )
+        )
+
+        result = self.run_workflow(
+            suffix,
+            "--nsys",
+            "--dry-run",
+            "--capture-mode",
+            "server-steps",
+            "--profile-phase",
+            "prefill",
+            "--cuda-graph-trace",
+            "none",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--cuda-graph-trace none", result.stdout)
+        self.assertNotIn("--cuda-graph-trace=none", result.stdout)
+
     def test_new_profile_options_validate_enums_and_integers(self):
         suffix = self.write_config(
             make_config(

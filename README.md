@@ -241,6 +241,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 采集命令固定包含 `--trace-fork-before-exec=true` 和
 `--capture-range-end=stop`。输出包括 `.nsys-rep`、`.nsys.log`、相邻的
 `.metadata.json` 和指定 summary 目录内的 `nsys_analysis.md`。
+Nsight Systems 的 `--cuda-graph-trace` 只接受 `graph|node`；workflow 的
+`--cuda-graph-trace none` 表示不向 Nsight 传该选项（使用 Nsight 默认行为），
+而不是传递无效的 `--cuda-graph-trace=none`。
 
 `full-offline` 在 benchmark 模块入口调用 CUDA Profiler API，因此包含模型初始化、
 NCCL init、allocator warmup，并可能包含 DeepGEMM JIT。metadata 固定记录
