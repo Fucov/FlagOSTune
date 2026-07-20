@@ -20,7 +20,10 @@ FORCE_PARSE_EXPORT=false
 ANALYZE_DEPENDENCIES=false
 ANALYZE_COMMUNICATION=false
 DEPENDENCY_TRACE=false
-CAPTURE_MODE="server-full"
+CAPTURE_MODE="full-offline"
+PROFILE_PHASE="full"
+PROFILE_START_STEP=0
+PROFILE_NUM_STEPS=5
 PROFILE_WARMUP_PROMPTS=2
 PROFILE_CONCURRENCY=""
 PROFILE_READY_TIMEOUT=3600
@@ -40,10 +43,13 @@ usage() {
   --nsys                启用独立 Nsight Systems profiling（必需）
   --nsys-output PREFIX  输出文件名前缀或路径，可带 .nsys-rep 后缀
   --scenario TYPE       optimized|full|shape，默认 optimized
-  --capture-mode MODE   server-full|full-offline，默认 server-full
-  --profile-warmup-prompts N 正式全推理采集前的 warmup prompt 数，默认 2
-  --profile-concurrency N 正式 benchmark 并发数（默认取场景配置）
-  --profile-ready-timeout N server readiness/benchmark 超时秒数，默认 3600
+  --capture-mode MODE   full-offline|server-steps，默认 full-offline
+  --profile-phase PHASE startup|prefill|decode|full，默认 full
+  --profile-start-step N phase gate 的用户起始 step，默认 0；HTTP 使用相对 step 0
+  --profile-num-steps N 采集 scheduler step 数，默认 5
+  --profile-warmup-prompts N capture 外 warmup prompt 数，默认 2
+  --profile-concurrency N server-steps benchmark 并发数（默认取场景配置）
+  --profile-ready-timeout N server readiness/decode 超时秒数，默认 3600
   --cuda-graph-trace M graph|node|none，默认 node；none 表示不传该 Nsight 选项
   --layerwise-nvtx M   auto|true|false，默认 auto
   --parse               采集成功后自动运行 parse_nsys.py
@@ -95,6 +101,21 @@ parse_args() {
             --capture-mode)
                 require_value "$1" "${2-}"
                 CAPTURE_MODE="$2"
+                shift 2
+                ;;
+            --profile-phase)
+                require_value "$1" "${2-}"
+                PROFILE_PHASE="$2"
+                shift 2
+                ;;
+            --profile-start-step)
+                require_value "$1" "${2-}"
+                PROFILE_START_STEP="$2"
+                shift 2
+                ;;
+            --profile-num-steps)
+                require_value "$1" "${2-}"
+                PROFILE_NUM_STEPS="$2"
                 shift 2
                 ;;
             --profile-warmup-prompts)
@@ -316,6 +337,13 @@ write_capture_metadata() {
     local output_prefix="$8"
     local nsys_log="$9"
     shift 9
+    local input_tokens="$1"
+    local output_tokens="$2"
+    local num_prompts="$3"
+    local concurrency="$4"
+    local cuda_graph_enabled="$5"
+    local layerwise_nvtx_enabled="$6"
+    shift 6
     local visible_devices="${CUDA_VISIBLE_DEVICES:-}"
     local git_commit nsys_version
     git_commit=$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || true)
@@ -327,7 +355,9 @@ write_capture_metadata() {
         "$git_commit" "$PROJECT_ROOT" "${SCRIPT_DIR}/sglang-nsys-workflow.sh" \
         "${SCRIPT_DIR}/tools/parse_nsys.py" "$nsys_version" \
         "${CAPTURE_START_WALL:-}" "${CAPTURE_END_WALL:-}" \
-        "${CAPTURE_DURATION_SECONDS:-}" "$@" <<'PY'
+        "${CAPTURE_DURATION_SECONDS:-}" "$PROFILE_PHASE" \
+        "$input_tokens" "$output_tokens" "$num_prompts" "$concurrency" \
+        "$cuda_graph_enabled" "$layerwise_nvtx_enabled" "$@" <<'PY'
 import hashlib
 import json
 import os
@@ -340,7 +370,9 @@ from datetime import datetime, timezone
     tp_size, visible_devices, config_path, output_prefix, nsys_log,
     capture_mode, git_commit, project_root, workflow_script, parser_script,
     nsys_version, capture_start_wall, capture_end_wall, capture_duration,
-) = sys.argv[1:21]
+    requested_phase, input_tokens, output_tokens, num_prompts, concurrency,
+    cuda_graph_enabled, layerwise_nvtx_enabled,
+) = sys.argv[1:28]
 
 def sha256(path):
     digest = hashlib.sha256()
@@ -354,7 +386,14 @@ dirty = subprocess.run(
     capture_output=True,
     text=True,
 ).stdout.strip()
+log_text = ""
+try:
+    with open(nsys_log, encoding="utf-8", errors="replace") as handle:
+        log_text = handle.read().lower()
+except OSError:
+    pass
 value = {
+    "capture_status": "PASS",
     "input_report": report_path,
     "model": model_name,
     "model_path": model_path,
@@ -368,8 +407,18 @@ value = {
     "capture_mode": capture_mode,
     "capture_scope": "startup_and_full_process",
     "inference_scope": "startup_and_full_process",
+    "requested_phase": requested_phase,
     "profile_phase": "full_process",
     "steady_state_guaranteed": False,
+    "num_prompts": int(num_prompts),
+    "input_tokens": int(input_tokens),
+    "output_tokens": int(output_tokens),
+    "concurrency": int(concurrency),
+    "benchmark_throughput": None,
+    "cuda_graph_enabled": cuda_graph_enabled == "true",
+    "layerwise_nvtx_enabled": layerwise_nvtx_enabled == "true",
+    "deepgemm_jit_detected": "deepgemm" in log_text and "jit" in log_text,
+    "moe_config_fallback_detected": "moe" in log_text and "fallback" in log_text,
     "git_commit": git_commit or None,
     "git_dirty": bool(dirty),
     "workflow_sha256": sha256(workflow_script),
@@ -381,7 +430,7 @@ value = {
     "benchmark_start_wall_time": capture_start_wall or None,
     "benchmark_end_wall_time": capture_end_wall or None,
     "benchmark_duration_seconds": float(capture_duration) if capture_duration else None,
-    "command": sys.argv[21:],
+    "command": sys.argv[28:],
     "generated_time": datetime.now(timezone.utc).astimezone().isoformat(),
 }
 temporary = metadata_path + ".tmp"
@@ -516,6 +565,10 @@ run_scenario() {
     server_log="${output_prefix}.server.log"
     benchmark_log="${output_prefix}.benchmark.log"
     metadata_path="${expected_report}.metadata.json"
+    graph_disabled=false
+    if extra_args_disable_cuda_graph "${extra_tokens[@]}"; then
+        graph_disabled=true
+    fi
     if [[ "$CAPTURE_MODE" == "full-offline" ]]; then
         cmd=(
             nsys profile
@@ -558,10 +611,6 @@ run_scenario() {
         [[ -n "$load_format" ]] && server_args+=(--load-format "$load_format")
         server_args+=("${extra_tokens[@]}")
 
-        graph_disabled=false
-        if extra_args_disable_cuda_graph "${extra_tokens[@]}"; then
-            graph_disabled=true
-        fi
         layerwise_enabled=false
         case "$LAYERWISE_NVTX" in
             true) layerwise_enabled=true ;;
@@ -626,13 +675,13 @@ run_scenario() {
         nsys_cmd+=(
             --force-overwrite=true
             --output "$output_prefix"
-            "$PYTHON_EXECUTABLE" "${SCRIPT_DIR}/tools/sglang_server_capture.py"
+            "$PYTHON_EXECUTABLE" "${SCRIPT_DIR}/tools/sglang_server_steps.py"
             exec-server --log "$server_log" --
             "$PYTHON_EXECUTABLE" -m sglang.launch_server
             "${server_args[@]}"
         )
         cmd=(
-            "$PYTHON_EXECUTABLE" "${SCRIPT_DIR}/tools/sglang_server_capture.py" run
+            "$PYTHON_EXECUTABLE" "${SCRIPT_DIR}/tools/sglang_server_steps.py" run
             --output-prefix "$output_prefix"
             --report "$expected_report"
             --metadata "$metadata_path"
@@ -640,9 +689,13 @@ run_scenario() {
             --nsys-log "$nsys_log"
             --benchmark-log "$benchmark_log"
             --base-url "http://${host}:${port}"
+            --profile-phase "$PROFILE_PHASE"
+            --profile-start-step "$PROFILE_START_STEP"
+            --profile-num-steps "$PROFILE_NUM_STEPS"
             --profile-warmup-prompts "$PROFILE_WARMUP_PROMPTS"
             --profile-concurrency "$profile_concurrency"
             --profile-ready-timeout "$PROFILE_READY_TIMEOUT"
+            --decode-log-pattern 'Decode batch|running request'
             --cuda-graph-enabled "$([[ "$graph_disabled" == "true" ]] && printf false || printf true)"
             --cuda-graph-trace "$CUDA_GRAPH_TRACE"
             --layerwise-nvtx-enabled "$layerwise_enabled"
@@ -681,6 +734,11 @@ run_scenario() {
     fi
 
     mkdir -p "$(dirname "$output_prefix")"
+    # A retry must never leave an earlier PASS metadata file beside a failed
+    # capture using the same explicit output prefix.
+    "$PYTHON_EXECUTABLE" -c \
+        'import pathlib,sys; pathlib.Path(sys.argv[1]).unlink(missing_ok=True)' \
+        "$metadata_path"
     : > "$nsys_log"
     print_command "[COMMAND]" "${cmd[@]}" | tee -a "$nsys_log"
     CAPTURE_START_WALL=$("$PYTHON_EXECUTABLE" -c 'from datetime import datetime; print(datetime.now().astimezone().isoformat())')
@@ -710,9 +768,12 @@ run_scenario() {
         write_capture_metadata \
             "$metadata_path" "$expected_report" "$model_name" "$model_path" \
             "$scenario_name" "$dataset_name" "$tensor_parallel" "$output_prefix" \
-            "$nsys_log" "${cmd[@]}"
+            "$nsys_log" "$input_len" "$output_len" "$num_prompts" \
+            "$scenario_concurrency" \
+            "$([[ "$graph_disabled" == "true" ]] && printf false || printf true)" \
+            false "${cmd[@]}"
     elif [[ ! -s "$metadata_path" ]]; then
-        log_error "server-full 完成但缺少成功 metadata: ${metadata_path}"
+        log_error "server-steps 完成但缺少成功 metadata: ${metadata_path}"
         exit 1
     fi
     log_info "采集元数据: ${metadata_path}"
@@ -729,12 +790,23 @@ main() {
         exit 2
     fi
     case "$CAPTURE_MODE" in
-        server-full|full-offline) ;;
+        full-offline|server-steps) ;;
         *)
-            log_error "--capture-mode 仅支持 server-full|full-offline，当前值: ${CAPTURE_MODE}"
+            log_error "--capture-mode 仅支持 full-offline|server-steps，当前值: ${CAPTURE_MODE}"
             exit 2
             ;;
     esac
+    case "$PROFILE_PHASE" in
+        startup|prefill|decode|full) ;;
+        *)
+            log_error "--profile-phase 仅支持 startup|prefill|decode|full，当前值: ${PROFILE_PHASE}"
+            exit 2
+            ;;
+    esac
+    if [[ "$CAPTURE_MODE" == "full-offline" && "$PROFILE_PHASE" != "full" && "$PROFILE_PHASE" != "startup" ]]; then
+        log_error "full-offline 始终是 startup/full_process capture，不能标注为 ${PROFILE_PHASE}；请使用 --capture-mode server-steps"
+        exit 2
+    fi
     case "$CUDA_GRAPH_TRACE" in
         graph|node|none) ;;
         *)
@@ -749,7 +821,11 @@ main() {
             exit 2
             ;;
     esac
-    for profile_value in PROFILE_WARMUP_PROMPTS PROFILE_READY_TIMEOUT; do
+    if [[ ! "$PROFILE_START_STEP" =~ ^[0-9]+$ ]]; then
+        log_error "--profile-start-step 必须是非负整数"
+        exit 2
+    fi
+    for profile_value in PROFILE_NUM_STEPS PROFILE_WARMUP_PROMPTS PROFILE_READY_TIMEOUT; do
         if [[ ! "${!profile_value}" =~ ^[1-9][0-9]*$ ]]; then
             log_error "--$(printf '%s' "$profile_value" | tr '[:upper:]_' '[:lower:]-') 必须是正整数"
             exit 2

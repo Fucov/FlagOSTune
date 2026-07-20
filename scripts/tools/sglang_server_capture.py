@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture one complete measured SGLang inference window with Nsight Systems."""
+"""Supervise phase-selective SGLang Nsight Systems server captures."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,10 +29,78 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
 
 
-def profile_request_body() -> dict:
-    # Omitting num_steps keeps profiling active until /stop_profile. This is
-    # required to cover the measured request's prefill and decode in one trace.
-    return {"activities": ["CUDA_PROFILER"]}
+def endpoint_metadata(
+    base_url: str, *, visible_devices: Optional[str] = None
+) -> dict:
+    parsed = urllib.parse.urlsplit(base_url)
+    return {
+        "base_url": base_url,
+        "host": parsed.hostname,
+        "port": parsed.port,
+        "visible_devices": visible_devices,
+    }
+
+
+def detect_log_flags(text: str) -> dict:
+    lowered = text.lower()
+    return {
+        "deepgemm_jit_detected": "deepgemm" in lowered and "jit" in lowered,
+        "moe_config_fallback_detected": "moe" in lowered and "fallback" in lowered,
+    }
+
+
+def prepare_capture_outputs(log_paths: Sequence[Path], metadata_path: Path) -> None:
+    """Clear owned logs and prevent stale PASS metadata from surviving a retry."""
+    metadata_path.unlink(missing_ok=True)
+    for path in log_paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+
+def profile_request_body(num_steps: int) -> dict:
+    """Build the SGLang scheduler-step profiler request.
+
+    Phase selection is performed by deciding when to send the request.  The
+    endpoint therefore receives a relative start step of zero, while the
+    requested scheduler-step count controls automatic profiler termination.
+    """
+    if num_steps <= 0:
+        raise ValueError("num_steps must be positive")
+    return {
+        "start_step": 0,
+        "num_steps": num_steps,
+        "activities": ["CUDA_PROFILER"],
+    }
+
+
+class DecodeDetector:
+    """Require both a decode marker and a positive running-request count."""
+
+    _decode = re.compile(r"\bDecode batch\b", re.IGNORECASE)
+    _running = re.compile(
+        r"running(?:[_\s]+(?:reqs?|request(?:\(s\)|s)?))?[^0-9]{0,20}([0-9]+)",
+        re.IGNORECASE,
+    )
+
+    def __init__(self) -> None:
+        self.decode_line: Optional[str] = None
+        self.running_line: Optional[str] = None
+
+    def feed(self, line: str) -> bool:
+        if self._decode.search(line):
+            self.decode_line = line.strip()
+        match = self._running.search(line)
+        if match and int(match.group(1)) > 0:
+            self.running_line = line.strip()
+        return self.decode_line is not None and self.running_line is not None
+
+    @property
+    def evidence(self) -> str:
+        values = []
+        for value in (self.decode_line, self.running_line):
+            if value and value not in values:
+                values.append(value)
+        return " | ".join(values)
 
 
 def _default_health_request(url: str, timeout: float) -> int:
@@ -68,6 +137,82 @@ def wait_ready(
     )
 
 
+def wait_for_decode(
+    log_path: Path,
+    timeout: float,
+    child_alive: Callable[[], None],
+    *,
+    poll_interval: float = 0.2,
+    start_offset: int = 0,
+) -> str:
+    """Incrementally monitor the server log for stable decode evidence."""
+    detector = DecodeDetector()
+    deadline = time.monotonic() + timeout
+    offset = start_offset
+    remainder = ""
+    while time.monotonic() < deadline:
+        if log_path.is_file():
+            with log_path.open(encoding="utf-8", errors="replace") as handle:
+                handle.seek(offset)
+                chunk = handle.read()
+                offset = handle.tell()
+            if chunk:
+                combined = remainder + chunk
+                lines = combined.splitlines(keepends=True)
+                remainder = ""
+                if lines and not lines[-1].endswith(("\n", "\r")):
+                    remainder = lines.pop()
+                for line in lines:
+                    if detector.feed(line):
+                        return detector.evidence
+                if remainder and detector.feed(remainder):
+                    return detector.evidence
+        child_alive()
+        time.sleep(poll_interval)
+    raise CaptureError(
+        f"decode evidence timeout after {timeout:g}s; no stable Decode batch "
+        "with positive running requests was observed"
+    )
+
+
+def wait_for_profile_completion(
+    log_path: Path,
+    start_offset: int,
+    timeout: float,
+    child_alive: Callable[[], None],
+    *,
+    poll_interval: float = 0.2,
+) -> str:
+    """Wait for SGLang's automatic num_steps profiler stop evidence."""
+    completed = re.compile(r"\bProfiling done\b", re.IGNORECASE)
+    deadline = time.monotonic() + timeout
+    offset = start_offset
+    remainder = ""
+    while time.monotonic() < deadline:
+        if log_path.is_file():
+            with log_path.open(encoding="utf-8", errors="replace") as handle:
+                handle.seek(offset)
+                chunk = handle.read()
+                offset = handle.tell()
+            if chunk:
+                combined = remainder + chunk
+                lines = combined.splitlines(keepends=True)
+                remainder = ""
+                if lines and not lines[-1].endswith(("\n", "\r")):
+                    remainder = lines.pop()
+                for line in lines:
+                    if completed.search(line):
+                        return line.strip()
+                if remainder and completed.search(remainder):
+                    return remainder.strip()
+        child_alive()
+        time.sleep(poll_interval)
+    raise CaptureError(
+        f"profile completion timeout after {timeout:g}s; SGLang did not log "
+        "automatic 'Profiling done' evidence for the requested num_steps"
+    )
+
+
 def http_json(
     method: str, url: str, body: Optional[Mapping[str, object]], timeout: float
 ) -> Tuple[int, object]:
@@ -96,8 +241,8 @@ def http_json(
         raise CaptureError(f"HTTP request failed: {method} {url}: {exc}") from exc
 
 
-def start_profile(base_url: str, timeout: float = 10.0) -> dict:
-    body = profile_request_body()
+def start_profile(base_url: str, num_steps: int, timeout: float = 10.0) -> dict:
+    body = profile_request_body(num_steps)
     status, response = http_json(
         "POST", base_url.rstrip("/") + "/start_profile", body, timeout
     )
@@ -105,7 +250,9 @@ def start_profile(base_url: str, timeout: float = 10.0) -> dict:
         raise CaptureError(
             f"/start_profile returned HTTP {status}: {response!r}; body={body!r}"
         )
-    if isinstance(response, Mapping) and response.get("error"):
+    if isinstance(response, Mapping) and (
+        response.get("error") or response.get("success") is False
+    ):
         raise CaptureError(f"/start_profile rejected request: {response!r}")
     return {"request": body, "status": status, "response": response}
 
@@ -118,7 +265,9 @@ def stop_profile(base_url: str, timeout: float = 10.0) -> dict:
         raise CaptureError(
             f"/stop_profile returned HTTP {status}: {response!r}"
         )
-    if isinstance(response, Mapping) and response.get("error"):
+    if isinstance(response, Mapping) and (
+        response.get("error") or response.get("success") is False
+    ):
         raise CaptureError(f"/stop_profile rejected request: {response!r}")
     return {"status": status, "response": response}
 
@@ -270,14 +419,15 @@ def run_capture(args: argparse.Namespace, commands: Mapping[str, Sequence[str]])
     benchmark_log = Path(args.benchmark_log).absolute()
     for path in (server_log, nsys_log, benchmark_log, report):
         path.parent.mkdir(parents=True, exist_ok=True)
-    for path in (server_log, nsys_log, benchmark_log):
-        path.write_text("", encoding="utf-8")
+    prepare_capture_outputs((server_log, nsys_log, benchmark_log), metadata_path)
 
     nsys_process: Optional[subprocess.Popen] = None
     benchmark_process: Optional[subprocess.Popen] = None
     ready_endpoint: Optional[str] = None
+    phase_evidence = ""
+    profile_completion_evidence = ""
+    profile_log_offset = 0
     profile_exchange: Optional[dict] = None
-    stop_exchange: Optional[dict] = None
     capture_start_iso: Optional[str] = None
     capture_start_monotonic: Optional[float] = None
     capture_end_iso: Optional[str] = None
@@ -303,14 +453,45 @@ def run_capture(args: argparse.Namespace, commands: Mapping[str, Sequence[str]])
                 args.base_url, args.profile_ready_timeout, alive
             )
 
+            if args.profile_phase == "startup":
+                profile_log_offset = server_log.stat().st_size if server_log.is_file() else 0
+                capture_start_iso = now_iso()
+                capture_start_monotonic = time.monotonic()
+                profile_exchange = start_profile(
+                    args.base_url, args.profile_num_steps
+                )
+                phase_evidence = (
+                    "profile started after HTTP readiness and before workload warmup; "
+                    "this is post-load startup/warmup evidence, not model-load capture"
+                )
+
             _run_logged(commands["warmup"], benchmark_log, "warmup")
 
-            capture_start_iso = now_iso()
-            capture_start_monotonic = time.monotonic()
-            profile_exchange = start_profile(args.base_url)
+            if args.profile_phase == "startup":
+                profile_completion_evidence = wait_for_profile_completion(
+                    server_log,
+                    profile_log_offset,
+                    args.profile_ready_timeout,
+                    alive,
+                )
+                capture_end_iso = now_iso()
+                capture_end_monotonic = time.monotonic()
+
+            if args.profile_phase in ("prefill", "full"):
+                profile_log_offset = server_log.stat().st_size if server_log.is_file() else 0
+                capture_start_iso = now_iso()
+                capture_start_monotonic = time.monotonic()
+                profile_exchange = start_profile(
+                    args.base_url, args.profile_num_steps
+                )
+                phase_evidence = (
+                    "profile started before measured benchmark "
+                    f"for requested {args.profile_phase} phase via {ready_endpoint}"
+                )
 
             benchmark_start_iso = now_iso()
             benchmark_start_monotonic = time.monotonic()
+            measured_log_offset = server_log.stat().st_size if server_log.is_file() else 0
             with benchmark_log.open("a", encoding="utf-8") as benchmark_handle:
                 benchmark_handle.write(
                     "[benchmark] "
@@ -324,6 +505,34 @@ def run_capture(args: argparse.Namespace, commands: Mapping[str, Sequence[str]])
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
                 )
+                if args.profile_phase == "decode":
+                    phase_evidence = wait_for_decode(
+                        server_log,
+                        args.profile_ready_timeout,
+                        lambda: (
+                            _child_alive(nsys_process, "nsys/server"),
+                            _child_alive(benchmark_process, "benchmark"),
+                        ),
+                        start_offset=measured_log_offset,
+                    )
+                    profile_log_offset = server_log.stat().st_size if server_log.is_file() else 0
+                    capture_start_iso = now_iso()
+                    capture_start_monotonic = time.monotonic()
+                    profile_exchange = start_profile(
+                        args.base_url, args.profile_num_steps
+                    )
+                if args.profile_phase != "startup":
+                    profile_completion_evidence = wait_for_profile_completion(
+                        server_log,
+                        profile_log_offset,
+                        args.profile_ready_timeout,
+                        lambda: (
+                            _child_alive(nsys_process, "nsys/server"),
+                            _child_alive(benchmark_process, "benchmark"),
+                        ),
+                    )
+                    capture_end_iso = now_iso()
+                    capture_end_monotonic = time.monotonic()
                 _wait_benchmark(
                     benchmark_process,
                     nsys_process,
@@ -332,9 +541,10 @@ def run_capture(args: argparse.Namespace, commands: Mapping[str, Sequence[str]])
             benchmark_end_iso = now_iso()
             benchmark_end_monotonic = time.monotonic()
             benchmark_process = None
-            stop_exchange = stop_profile(args.base_url)
-            capture_end_iso = now_iso()
-            capture_end_monotonic = time.monotonic()
+            # num_steps makes SGLang call cudaProfilerStop automatically.  Do
+            # not issue /stop_profile here: doing so would turn a selective
+            # capture into a benchmark-duration capture and may race the
+            # scheduler's automatic stop.
             terminate_process_group(nsys_process, grace_seconds=15.0)
             nsys_process = None
 
@@ -345,16 +555,28 @@ def run_capture(args: argparse.Namespace, commands: Mapping[str, Sequence[str]])
         workflow_script = Path(args.workflow_script).absolute()
         parser_script = Path(args.parser_script).absolute()
         git_commit, git_dirty = _git_identity(project_root)
+        server_log_text = server_log.read_text(encoding="utf-8", errors="replace")
         metadata = {
             "capture_status": "PASS",
             "input_report": str(report),
             "report_size": report.stat().st_size,
-            "capture_mode": "server-full",
-            "capture_scope": "measured_inference",
-            "inference_scope": "prefill_and_decode",
-            "steady_state_guaranteed": True,
+            "capture_mode": "server-steps",
+            "capture_scope": "scheduler_steps",
+            "inference_scope": "phase_selective_scheduler_steps",
+            "steady_state_guaranteed": args.profile_phase in ("prefill", "decode"),
+            "requested_phase": args.profile_phase,
+            "profile_phase": args.profile_phase,
+            "detected_phase": args.profile_phase.upper(),
+            "phase_confidence": "HIGH" if args.profile_phase == "decode" else "MEDIUM",
+            "phase_evidence": phase_evidence,
+            "profile_completion_evidence": profile_completion_evidence,
+            "capture_end_source": "server_log_automatic_profile_stop",
+            "profile_start_step": args.profile_start_step,
+            "effective_profile_start_step": 0,
+            "profile_num_steps": args.profile_num_steps,
+            "profile_warmup_prompts": args.profile_warmup_prompts,
+            "profile_ready_timeout_seconds": args.profile_ready_timeout,
             "profile_request": profile_exchange,
-            "profile_stop_response": stop_exchange,
             "readiness_endpoint": ready_endpoint,
             "capture_start_wall_time": capture_start_iso,
             "capture_end_wall_time": capture_end_iso,
@@ -381,17 +603,10 @@ def run_capture(args: argparse.Namespace, commands: Mapping[str, Sequence[str]])
             "concurrency": args.profile_concurrency,
             "tp_size": args.tp_size,
             "benchmark_throughput": _parse_throughput(benchmark_log),
+            "benchmark_status": "PASS",
             "cuda_graph_enabled": args.cuda_graph_enabled,
             "cuda_graph_trace": args.cuda_graph_trace,
             "layerwise_nvtx_enabled": args.layerwise_nvtx_enabled,
-            "deepgemm_jit_detected": "deepgemm" in server_log.read_text(
-                encoding="utf-8", errors="replace"
-            ).lower() and "jit" in server_log.read_text(
-                encoding="utf-8", errors="replace"
-            ).lower(),
-            "moe_config_fallback_detected": "fallback" in server_log.read_text(
-                encoding="utf-8", errors="replace"
-            ).lower(),
             "git_commit": git_commit,
             "git_dirty": git_dirty,
             "workflow_sha256": _sha256(workflow_script),
@@ -405,16 +620,18 @@ def run_capture(args: argparse.Namespace, commands: Mapping[str, Sequence[str]])
             "benchmark_command": list(commands["benchmark"]),
             "generated_time": now_iso(),
         }
+        metadata.update(detect_log_flags(server_log_text))
+        metadata.update(
+            endpoint_metadata(
+                args.base_url,
+                visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
+            )
+        )
         _atomic_json(metadata_path, metadata)
         return metadata
     finally:
         if benchmark_process is not None:
             terminate_process_group(benchmark_process, grace_seconds=2.0)
-        if profile_exchange is not None and stop_exchange is None and nsys_process is not None:
-            try:
-                stop_profile(args.base_url)
-            except CaptureError:
-                pass
         if nsys_process is not None:
             terminate_process_group(nsys_process, grace_seconds=5.0)
 
@@ -427,7 +644,7 @@ def _bool(value: str) -> bool:
 
 
 def build_run_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="sglang_server_capture.py run")
+    parser = argparse.ArgumentParser(prog="sglang_server_steps.py run")
     parser.add_argument("--output-prefix", required=True)
     parser.add_argument("--report", required=True)
     parser.add_argument("--metadata", required=True)
@@ -435,9 +652,13 @@ def build_run_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nsys-log", required=True)
     parser.add_argument("--benchmark-log", required=True)
     parser.add_argument("--base-url", required=True)
+    parser.add_argument("--profile-phase", choices=("startup", "prefill", "decode", "full"), required=True)
+    parser.add_argument("--profile-start-step", type=int, default=0)
+    parser.add_argument("--profile-num-steps", type=int, required=True)
     parser.add_argument("--profile-warmup-prompts", type=int, required=True)
     parser.add_argument("--profile-concurrency", type=int, required=True)
     parser.add_argument("--profile-ready-timeout", type=float, required=True)
+    parser.add_argument("--decode-log-pattern")
     parser.add_argument("--cuda-graph-enabled", type=_bool, required=True)
     parser.add_argument("--cuda-graph-trace", choices=("graph", "node", "none"), required=True)
     parser.add_argument("--layerwise-nvtx-enabled", type=_bool, required=True)
@@ -457,7 +678,7 @@ def build_run_parser() -> argparse.ArgumentParser:
 
 
 def exec_server(argv: Sequence[str]) -> int:
-    parser = argparse.ArgumentParser(prog="sglang_server_capture.py exec-server")
+    parser = argparse.ArgumentParser(prog="sglang_server_steps.py exec-server")
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)

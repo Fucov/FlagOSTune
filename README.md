@@ -202,45 +202,79 @@ python scripts/tools/perf_summary_torch.py
 安装 `nsys`、`yq` v4、带 CUDA 的 PyTorch 和 SGLang。本地无 GPU/NSys 时可先
 追加 `--dry-run`，检查模型配置、设备、TP、输出路径和完整命令。
 
-Qwen TP4 一次完成完整推理窗口（prefill + decode）采集、SQLite 导出、
-热点算子与通算融合分析：
+Qwen TP4 prefill scheduler-step 采集、SQLite 导出和通信分析：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 ./scripts/sglang-nsys-workflow.sh \
   --model Qwen3.6-35B-A3B-FP8-TP4-P128D16 \
   --nsys \
-  --capture-mode server-full \
-  --nsys-output qwen-tp4-full \
+  --capture-mode server-steps \
+  --profile-phase prefill \
+  --profile-start-step 0 \
+  --profile-num-steps 1 \
+  --profile-warmup-prompts 2 \
+  --profile-concurrency 1 \
+  --cuda-graph-trace node \
+  --layerwise-nvtx auto \
+  --nsys-output qwen-tp4-prefill \
   --parse \
   --parse-top 20 \
-  --parse-output-dir results/Qwen3.6-35B-A3B-FP8-TP4-P128D16/nsys/qwen-tp4-full-summary \
+  --parse-output-dir results/Qwen3.6-35B-A3B-FP8-TP4-P128D16/nsys/qwen-tp4-prefill-summary \
   --analyze-dependencies \
   --analyze-communication \
   --dependency-trace
 ```
 
-DeepSeek TP8 使用相同的合并口径：
+DeepSeek TP8 decode 采集由 server log 驱动，不使用固定 sleep 猜测开始时间：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 ./scripts/sglang-nsys-workflow.sh \
   --model DeepSeek-V4-Flash-FP8-TP8-Profile-P2048D32C64 \
   --nsys \
-  --capture-mode server-full \
-  --nsys-output deepseek-tp8-full \
+  --capture-mode server-steps \
+  --profile-phase decode \
+  --profile-start-step 0 \
+  --profile-num-steps 5 \
+  --profile-warmup-prompts 2 \
+  --profile-concurrency 64 \
+  --cuda-graph-trace node \
+  --layerwise-nvtx auto \
+  --nsys-output deepseek-tp8-decode \
   --parse \
   --parse-top 20 \
-  --parse-output-dir results/DeepSeek-V4-Flash-FP8-TP8-Profile-P2048D32C64/nsys/deepseek-tp8-full-summary \
+  --parse-output-dir results/DeepSeek-V4-Flash-FP8-TP8-Profile-P2048D32C64/nsys/deepseek-tp8-decode-summary \
   --analyze-dependencies \
   --analyze-communication \
   --dependency-trace
 ```
 
-`server-full` 是默认主路径。它先等待 server ready，运行 capture 外 warmup，
-然后在正式 benchmark 前调用无 `num_steps` 的 SGLang `/start_profile`，benchmark
-全部请求完成后调用 `/stop_profile`。因此同一 trace 同时包含正式请求的 prefill +
-decode，不会按阶段拆成两份报告，也不会把固定 scheduler step 数误当成完整推理。
+`server-steps` 使用 `nsys profile` 启动 `python -m sglang.launch_server`，等待
+`/health_generate`、`/health` 或 fallback `/v1/models` ready，再在 capture 外运行
+`sglang.bench_serving` warmup。prefill/full 在正式 benchmark 前调用
+`/start_profile`；decode 先后台启动 benchmark，随后只扫描 benchmark 启动后新增的
+server log，检测到 `Decode batch` 且 running request 大于 0 后才调用
+`/start_profile`。请求体固定为：
+
+```json
+{"start_step": 0, "num_steps": 5, "activities": ["CUDA_PROFILER"]}
+```
+
+phase gate 已经决定采集开始时机，所以 HTTP 使用相对 `start_step=0`；
+`--profile-start-step` 保存用户请求值和兼容 metadata，不把它伪报为 endpoint 的绝对
+step。指定 `num_steps` 后 SGLang 会自动调用 `cudaProfilerStop()`；workflow 等待
+server log 的 `Profiling done` 证据，之后等待 benchmark 完成、优雅停止 server 并
+等待 Nsight finalize。该路径不调用手动 `/stop_profile`，避免把指定 steps 扩大成
+整个 benchmark capture。
+
+`full-offline` 继续使用 `cuda_profiler_launcher.py` →
+`sglang.bench_offline_throughput`，只用于 startup/full-process 调查。metadata 固定写入
+`capture_scope=startup_and_full_process`、`profile_phase=full_process` 和
+`steady_state_guaranteed=false`。它包含模型初始化和 NCCL init，可能包含 DeepGEMM
+JIT，不能用于稳定 decode 通信占比，也不会自动标注为 decode。`server-steps` 的
+`startup` 发生在 HTTP ready 后，只代表 post-load warmup；真正的模型启动采集应使用
+`full-offline --profile-phase startup`。
 
 `--dependency-trace` 会增加较昂贵的 CUDA event tracing，仅在需要事件级分析时
 启用。只需要全窗口 Top 算子、NVTX、CUDA API 和多卡汇总时可删除最后三项分析参数。
@@ -251,8 +285,9 @@ Nsight Systems 的 `--cuda-graph-trace` 只接受 `graph|node`；workflow 的
 `--cuda-graph-trace none` 表示不向 Nsight 传该选项（使用 Nsight 默认行为），
 而不是传递无效的 `--cuda-graph-trace=none`。
 
-报告主表把全窗口内所有 GPU kernel 按归一化 family 累计总时间后统一排序，
-不按 prefill/decode 分组。每个 Top 算子都给出通算融合 `YES / NO / UNKNOWN`：
+报告主表把 capture range 内所有 GPU kernel 按归一化 family 累计总时间后统一排序，
+phase 由 workflow metadata、server log 和 NVTX 证据共同校验。每个 Top 算子都给出
+通算融合 `YES / NO / UNKNOWN`：
 
 - `YES`：同一个 kernel 名称同时具备明确 fusion、通信和模型计算证据。
 - `NO`：可确认是独立计算、独立通信或通信初始化 kernel。
@@ -264,9 +299,9 @@ latency。`full-offline` 仅保留为显式的 startup/full-process 调查模式
 加载、NCCL init、allocator warmup，并可能包含 DeepGEMM JIT，不用于主热点结论。
 
 server stdout/stderr、Nsight stdout/stderr 和 benchmark log 分别写入
-`.server.log`、`.nsys.log` 和 `.benchmark.log`。readiness、warmup、
-`/start_profile`、benchmark、`/stop_profile`、server、Nsight finalize 或空 report
-任一失败时，workflow 返回非零且不写 PASS metadata。
+`.server.log`、`.nsys.log` 和 `.benchmark.log`。readiness、warmup、decode evidence、
+`/start_profile`、自动 `Profiling done`、benchmark、server、Nsight finalize 或空
+report 任一失败时，workflow 返回非零且不写 PASS metadata。
 
 单独解析已有报告（进度写 stderr，Markdown 写 stdout，因此 `tee` 可用）：
 
