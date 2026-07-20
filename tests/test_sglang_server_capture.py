@@ -217,14 +217,18 @@ class SGLangServerCaptureTest(unittest.TestCase):
             args = self._capture_args(root)
             report = Path(args.report)
             events = []
+            control_timeouts = {}
 
             def fake_http(_method, url, _body, _timeout):
                 if url.endswith("/flush_cache"):
                     events.append("flush")
+                    control_timeouts["flush"] = _timeout
                 elif url.endswith("/start_profile"):
                     events.append("start")
+                    control_timeouts["start"] = _timeout
                 elif url.endswith("/stop_profile"):
                     events.append("stop")
+                    control_timeouts["stop"] = _timeout
                 return 200, {"success": True}
 
             def fake_run(_command, _log_path, label, **_kwargs):
@@ -282,6 +286,9 @@ class SGLangServerCaptureTest(unittest.TestCase):
             self.assertEqual(metadata["captured_run"], 2)
             self.assertEqual(metadata["num_prompts"], 64)
             self.assertEqual(metadata["concurrency"], 64)
+            self.assertEqual(
+                control_timeouts["stop"], args.profile_ready_timeout
+            )
             stored = json.loads(Path(args.metadata).read_text(encoding="utf-8"))
             self.assertEqual(stored["capture_status"], "PASS")
 
@@ -372,7 +379,9 @@ class SGLangServerCaptureTest(unittest.TestCase):
                         args,
                         {"nsys": ["nsys"], "benchmark": ["bench"]},
                     )
-            stop.assert_called_once_with(args.base_url)
+            stop.assert_called_once_with(
+                args.base_url, timeout=args.profile_ready_timeout
+            )
             self.assertFalse(Path(args.metadata).exists())
 
     def test_empty_report_after_normal_stop_is_fatal(self):

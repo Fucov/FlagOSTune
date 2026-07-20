@@ -381,7 +381,9 @@ def run_capture(args: argparse.Namespace, commands: Mapping[str, Sequence[str]])
             )
             benchmark_end_iso = now_iso()
             benchmark_end_monotonic = time.monotonic()
-            stop_exchange = stop_profile(args.base_url)
+            stop_exchange = stop_profile(
+                args.base_url, timeout=args.profile_ready_timeout
+            )
             capture_end_iso = now_iso()
             capture_end_monotonic = time.monotonic()
             terminate_process_group(nsys_process, grace_seconds=15.0)
@@ -469,7 +471,9 @@ def run_capture(args: argparse.Namespace, commands: Mapping[str, Sequence[str]])
             and nsys_process is not None
         ):
             try:
-                stop_profile(args.base_url)
+                stop_profile(
+                    args.base_url, timeout=args.profile_ready_timeout
+                )
             except CaptureError:
                 pass
         if nsys_process is not None:
