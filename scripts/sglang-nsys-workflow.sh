@@ -20,12 +20,7 @@ FORCE_PARSE_EXPORT=false
 ANALYZE_DEPENDENCIES=false
 ANALYZE_COMMUNICATION=false
 DEPENDENCY_TRACE=false
-CAPTURE_MODE="full-offline"
-PROFILE_PHASE="full"
-PROFILE_START_STEP=0
-PROFILE_NUM_STEPS=5
-PROFILE_WARMUP_PROMPTS=2
-PROFILE_CONCURRENCY=""
+CAPTURE_MODE="server-full"
 PROFILE_READY_TIMEOUT=3600
 CUDA_GRAPH_TRACE="node"
 LAYERWISE_NVTX="auto"
@@ -43,13 +38,8 @@ usage() {
   --nsys                启用独立 Nsight Systems profiling（必需）
   --nsys-output PREFIX  输出文件名前缀或路径，可带 .nsys-rep 后缀
   --scenario TYPE       optimized|full|shape，默认 optimized
-  --capture-mode MODE   full-offline|server-steps，默认 full-offline
-  --profile-phase PHASE startup|prefill|decode|full，默认 full
-  --profile-start-step N phase gate 的用户起始 step，默认 0；HTTP 使用相对 step 0
-  --profile-num-steps N 采集 scheduler step 数，默认 5
-  --profile-warmup-prompts N capture 外 warmup prompt 数，默认 2
-  --profile-concurrency N server-steps benchmark 并发数（默认取场景配置）
-  --profile-ready-timeout N server readiness/decode 超时秒数，默认 3600
+  --capture-mode MODE   server-full|full-offline，默认 server-full
+  --profile-ready-timeout N server readiness/benchmark 超时秒数，默认 3600
   --cuda-graph-trace M graph|node|none，默认 node；none 表示不传该 Nsight 选项
   --layerwise-nvtx M   auto|true|false，默认 auto
   --parse               采集成功后自动运行 parse_nsys.py
@@ -101,31 +91,6 @@ parse_args() {
             --capture-mode)
                 require_value "$1" "${2-}"
                 CAPTURE_MODE="$2"
-                shift 2
-                ;;
-            --profile-phase)
-                require_value "$1" "${2-}"
-                PROFILE_PHASE="$2"
-                shift 2
-                ;;
-            --profile-start-step)
-                require_value "$1" "${2-}"
-                PROFILE_START_STEP="$2"
-                shift 2
-                ;;
-            --profile-num-steps)
-                require_value "$1" "${2-}"
-                PROFILE_NUM_STEPS="$2"
-                shift 2
-                ;;
-            --profile-warmup-prompts)
-                require_value "$1" "${2-}"
-                PROFILE_WARMUP_PROMPTS="$2"
-                shift 2
-                ;;
-            --profile-concurrency)
-                require_value "$1" "${2-}"
-                PROFILE_CONCURRENCY="$2"
                 shift 2
                 ;;
             --profile-ready-timeout)
@@ -355,7 +320,7 @@ write_capture_metadata() {
         "$git_commit" "$PROJECT_ROOT" "${SCRIPT_DIR}/sglang-nsys-workflow.sh" \
         "${SCRIPT_DIR}/tools/parse_nsys.py" "$nsys_version" \
         "${CAPTURE_START_WALL:-}" "${CAPTURE_END_WALL:-}" \
-        "${CAPTURE_DURATION_SECONDS:-}" "$PROFILE_PHASE" \
+        "${CAPTURE_DURATION_SECONDS:-}" full \
         "$input_tokens" "$output_tokens" "$num_prompts" "$concurrency" \
         "$cuda_graph_enabled" "$layerwise_nvtx_enabled" "$@" <<'PY'
 import hashlib
@@ -511,7 +476,8 @@ run_scenario() {
     local quantization="${14}"
     local load_format="${15}"
     local extra_args="${16}"
-    local base scenario_name input_len output_len num_prompts scenario_concurrency profile_concurrency
+    local benchmark_num_runs="${17}"
+    local base scenario_name input_len output_len num_prompts scenario_concurrency
     local host port configured_port graph_disabled layerwise_enabled
     local output_prefix expected_report nsys_log server_log benchmark_log metadata_path report_size nsys_status
 
@@ -521,7 +487,6 @@ run_scenario() {
     output_len=$(yq_read "${base}.output_len // 1024")
     num_prompts=$(yq_read "${base}.num_prompts // ${base}.concurrency // 1")
     scenario_concurrency=$(yq_read "${base}.concurrency // 1")
-    profile_concurrency="${PROFILE_CONCURRENCY:-$scenario_concurrency}"
     host=$(empty_if_null "$(yq_read '.benchmark.host // "127.0.0.1"')")
     port=$(yq_read '.benchmark.port // .benchmark.port_base // 30000')
 
@@ -645,17 +610,11 @@ run_scenario() {
         else
             client_common+=(--sharegpt-output-len "$output_len")
         fi
-        warmup_cmd=(
-            "$PYTHON_EXECUTABLE" -m sglang.bench_serving
-            "${client_common[@]}"
-            --num-prompts "$PROFILE_WARMUP_PROMPTS"
-            --max-concurrency "$profile_concurrency"
-        )
         benchmark_cmd=(
             "$PYTHON_EXECUTABLE" -m sglang.bench_serving
             "${client_common[@]}"
             --num-prompts "$num_prompts"
-            --max-concurrency "$profile_concurrency"
+            --max-concurrency "$scenario_concurrency"
         )
         nsys_cmd=(
             nsys profile
@@ -675,13 +634,13 @@ run_scenario() {
         nsys_cmd+=(
             --force-overwrite=true
             --output "$output_prefix"
-            "$PYTHON_EXECUTABLE" "${SCRIPT_DIR}/tools/sglang_server_steps.py"
+            "$PYTHON_EXECUTABLE" "${SCRIPT_DIR}/tools/sglang_server_capture.py"
             exec-server --log "$server_log" --
             "$PYTHON_EXECUTABLE" -m sglang.launch_server
             "${server_args[@]}"
         )
         cmd=(
-            "$PYTHON_EXECUTABLE" "${SCRIPT_DIR}/tools/sglang_server_steps.py" run
+            "$PYTHON_EXECUTABLE" "${SCRIPT_DIR}/tools/sglang_server_capture.py" run
             --output-prefix "$output_prefix"
             --report "$expected_report"
             --metadata "$metadata_path"
@@ -689,13 +648,9 @@ run_scenario() {
             --nsys-log "$nsys_log"
             --benchmark-log "$benchmark_log"
             --base-url "http://${host}:${port}"
-            --profile-phase "$PROFILE_PHASE"
-            --profile-start-step "$PROFILE_START_STEP"
-            --profile-num-steps "$PROFILE_NUM_STEPS"
-            --profile-warmup-prompts "$PROFILE_WARMUP_PROMPTS"
-            --profile-concurrency "$profile_concurrency"
+            --total-runs "$benchmark_num_runs"
+            --concurrency "$scenario_concurrency"
             --profile-ready-timeout "$PROFILE_READY_TIMEOUT"
-            --decode-log-pattern 'Decode batch|running request'
             --cuda-graph-enabled "$([[ "$graph_disabled" == "true" ]] && printf false || printf true)"
             --cuda-graph-trace "$CUDA_GRAPH_TRACE"
             --layerwise-nvtx-enabled "$layerwise_enabled"
@@ -712,7 +667,6 @@ run_scenario() {
             --output-tokens "$output_len"
             --tp-size "$tensor_parallel"
             --nsys-command "${nsys_cmd[@]}"
-            --warmup-command "${warmup_cmd[@]}"
             --benchmark-command "${benchmark_cmd[@]}"
         )
     fi
@@ -773,7 +727,7 @@ run_scenario() {
             "$([[ "$graph_disabled" == "true" ]] && printf false || printf true)" \
             false "${cmd[@]}"
     elif [[ ! -s "$metadata_path" ]]; then
-        log_error "server-steps 完成但缺少成功 metadata: ${metadata_path}"
+        log_error "server-full 完成但缺少成功 metadata: ${metadata_path}"
         exit 1
     fi
     log_info "采集元数据: ${metadata_path}"
@@ -790,23 +744,12 @@ main() {
         exit 2
     fi
     case "$CAPTURE_MODE" in
-        full-offline|server-steps) ;;
+        server-full|full-offline) ;;
         *)
-            log_error "--capture-mode 仅支持 full-offline|server-steps，当前值: ${CAPTURE_MODE}"
+            log_error "--capture-mode 仅支持 server-full|full-offline，当前值: ${CAPTURE_MODE}"
             exit 2
             ;;
     esac
-    case "$PROFILE_PHASE" in
-        startup|prefill|decode|full) ;;
-        *)
-            log_error "--profile-phase 仅支持 startup|prefill|decode|full，当前值: ${PROFILE_PHASE}"
-            exit 2
-            ;;
-    esac
-    if [[ "$CAPTURE_MODE" == "full-offline" && "$PROFILE_PHASE" != "full" && "$PROFILE_PHASE" != "startup" ]]; then
-        log_error "full-offline 始终是 startup/full_process capture，不能标注为 ${PROFILE_PHASE}；请使用 --capture-mode server-steps"
-        exit 2
-    fi
     case "$CUDA_GRAPH_TRACE" in
         graph|node|none) ;;
         *)
@@ -821,18 +764,8 @@ main() {
             exit 2
             ;;
     esac
-    if [[ ! "$PROFILE_START_STEP" =~ ^[0-9]+$ ]]; then
-        log_error "--profile-start-step 必须是非负整数"
-        exit 2
-    fi
-    for profile_value in PROFILE_NUM_STEPS PROFILE_WARMUP_PROMPTS PROFILE_READY_TIMEOUT; do
-        if [[ ! "${!profile_value}" =~ ^[1-9][0-9]*$ ]]; then
-            log_error "--$(printf '%s' "$profile_value" | tr '[:upper:]_' '[:lower:]-') 必须是正整数"
-            exit 2
-        fi
-    done
-    if [[ -n "$PROFILE_CONCURRENCY" && ! "$PROFILE_CONCURRENCY" =~ ^[1-9][0-9]*$ ]]; then
-        log_error "--profile-concurrency 必须是正整数"
+    if [[ ! "$PROFILE_READY_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "--profile-ready-timeout 必须是正整数"
         exit 2
     fi
     if [[ ! "$PARSE_TOP" =~ ^[1-9][0-9]*$ ]]; then
@@ -857,7 +790,7 @@ main() {
     local model_path model_name tokenizer_path tensor_parallel
     local dataset_name dataset_path trust_remote_code
     local dtype mem_fraction context_length quantization load_format extra_args
-    local scenario_count timestamp index
+    local benchmark_num_runs scenario_count timestamp index
     model_path=$(empty_if_null "$(yq_read '.model.path // ""')")
     model_name=$(empty_if_null "$(yq_read '.model.name // ""')")
     tokenizer_path=$(empty_if_null "$(yq_read '.model.tokenizer_path // .model.path // ""')")
@@ -871,12 +804,17 @@ main() {
     quantization=$(empty_if_null "$(yq_read '.sglang.quantization // ""')")
     load_format=$(empty_if_null "$(yq_read '.sglang.load_format // ""')")
     extra_args=$(empty_if_null "$(yq_read '.sglang.extra_args // .serve.extra_args // ""')")
+    benchmark_num_runs=$(yq_read '.benchmark.num_runs // 1')
 
     if [[ -z "$model_path" || -z "$model_name" ]]; then
         log_error "配置中的 model.path 和 model.name 不能为空"
         exit 1
     fi
     validate_model_family "$model_name" "$model_path" "$tensor_parallel"
+    if [[ ! "$benchmark_num_runs" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "benchmark.num_runs 必须是正整数"
+        exit 1
+    fi
 
     scenario_count=$(yq_read ".benchmark.scenarios.${SCENARIO_TYPE} | length")
     if [[ ! "$scenario_count" =~ ^[1-9][0-9]*$ ]]; then
@@ -893,7 +831,7 @@ main() {
             "$model_path" "$model_name" "$tokenizer_path" "$tensor_parallel" \
             "$dataset_name" "$dataset_path" "$trust_remote_code" \
             "$dtype" "$mem_fraction" "$context_length" "$quantization" \
-            "$load_format" "$extra_args"
+            "$load_format" "$extra_args" "$benchmark_num_runs"
     done
 }
 
