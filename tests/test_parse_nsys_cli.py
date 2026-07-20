@@ -94,6 +94,25 @@ class ParseNsysCliTest(unittest.TestCase):
         self.assertEqual(forced.returncode, 0, forced.stderr)
         self.assertEqual(sum(line.startswith("export ") for line in self.calls.read_text().splitlines()), 1)
 
+    def test_resume_reuses_valid_native_stats_csv(self):
+        output = self.root / "resume-summary"
+        first = self.run_parser("--output-dir", str(output), "--reports", "cuda_api_sum")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.calls.unlink()
+
+        resumed = self.run_parser(
+            "--output-dir", str(output), "--reports", "cuda_api_sum", "--resume"
+        )
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        calls = self.calls.read_text().splitlines()
+        self.assertFalse(any(line.startswith("stats ") for line in calls))
+        self.assertIn("REUSED Detect supported reports", resumed.stderr)
+        self.assertIn("REUSED Generate cuda_gpu_kern_sum", resumed.stderr)
+        self.assertIn("REUSED Generate cuda_api_sum", resumed.stderr)
+        metadata = json.loads((output / "metadata.json").read_text())
+        self.assertEqual(metadata["base_stats_status"], "REUSED")
+
     def test_optional_failure_warns_but_core_failure_is_nonzero(self):
         optional = self.run_parser("--reports", "nvtx_sum", extra_env={"NSYS_FAIL": "nvtx_sum"})
         self.assertEqual(optional.returncode, 0, optional.stderr)

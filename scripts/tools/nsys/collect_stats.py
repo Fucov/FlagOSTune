@@ -9,6 +9,7 @@ from typing import Iterable, List, Optional, Sequence, Set
 
 from .models import ReportCollection, WarningRecord
 from .progress import ProgressReporter, run_streaming_command
+from .utils import read_csv_rows
 
 
 class CoreReportError(RuntimeError):
@@ -133,11 +134,20 @@ def collect_reports(
     output_dir: Path,
     progress: ProgressReporter,
     allow_core_fallback: bool = False,
+    reuse_existing: bool = False,
 ) -> ReportCollection:
     output_dir.mkdir(parents=True, exist_ok=True)
     collection = ReportCollection()
     for report_name in report_names:
         candidates = report_candidates(report_name)
+        final_path = output_dir / report_filename(report_name)
+        if reuse_existing and final_path.is_file() and read_csv_rows(final_path):
+            stage_name = f"Generate {report_name}"
+            started = progress.begin(stage_name, input_path=sqlite_path, output_path=final_path)
+            collection.successful[report_name] = final_path
+            collection.selected_sources[report_name] = "existing CSV"
+            progress.finish(stage_name, started, "REUSED", output_path=final_path)
+            continue
         is_supported = supported_reports is None or any(
             candidate in supported_reports or report_name in supported_reports
             for candidate in candidates
@@ -151,7 +161,6 @@ def collect_reports(
             progress.warning(message)
             continue
 
-        final_path = output_dir / report_filename(report_name)
         candidate_errors = []
         selected = None
         for candidate in candidates:

@@ -114,6 +114,29 @@ class NsysRenderMarkdownTest(unittest.TestCase):
         markdown = render_markdown(data, top=20)
         self.assertIn("N/A", markdown)
 
+    def test_nvtx_diagnostics_explain_skips_without_event_type_semantics(self):
+        data = AnalysisData(
+            metadata={
+                "nvtx_load_status": "PASS_WITH_WARNINGS",
+                "nvtx_load_stats": {
+                    "valid_closed_ranges": 2946116,
+                    "null_start_rows": 0,
+                    "null_end_rows": 16,
+                    "invalid_interval_rows": 0,
+                    "load_duration_seconds": 1.5,
+                    "estimated_memory_bytes": 1024,
+                    "counts_by_event_type": {59: 2946116, 75: 8, 39: 8},
+                    "skipped_by_event_type": {75: 8, 39: 8},
+                },
+            },
+            reports=ReportCollection(),
+        )
+        markdown = render_markdown(data)
+        self.assertIn("### NVTX Diagnostics", markdown)
+        self.assertIn("NULL end rows skipped: `16`", markdown)
+        self.assertIn("No end timestamp is synthesized", markdown)
+        self.assertIn("not assigned universal semantics", markdown)
+
     def test_mapping_table_does_not_render_python_list_literals(self):
         data = AnalysisData(
             metadata={"analysis_completeness_reasons": ["one", "two"]},

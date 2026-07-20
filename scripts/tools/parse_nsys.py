@@ -49,6 +49,7 @@ from scripts.tools.nsys.sqlite_events import (
     load_kernel_events,
     load_memory_events,
     write_event_artifacts,
+    write_event_metadata,
     write_kernel_summary_from_events,
 )
 from scripts.tools.nsys.utils import atomic_write_json, normalize_header, read_csv_rows
@@ -174,6 +175,21 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--nsys", default="nsys", help="nsys executable path")
     parser.add_argument("--analyze-dependencies", action="store_true")
     parser.add_argument("--analyze-communication", action="store_true")
+    parser.add_argument(
+        "--analyze-nvtx-attribution",
+        action="store_true",
+        help="load NVTX intervals and attribute kernels through CUDA API correlation",
+    )
+    parser.add_argument(
+        "--reuse-existing-stats",
+        action="store_true",
+        help="reuse valid CSV reports already present in --output-dir",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume analysis and reuse valid existing CSV reports",
+    )
     parser.add_argument("--phase-log", type=Path)
     parser.add_argument("--phase-metadata", type=Path)
     return parser.parse_args(argv)
@@ -274,17 +290,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         version = _nsys_version(args.nsys, output_dir, progress)
         detection_warnings = []
-        try:
-            supported = detect_supported_reports(
-                args.nsys, output_dir, progress, warnings=detection_warnings
-            )
-        except CoreReportError as exc:
-            message = (
-                f"{exc}; falling back to direct report probes against the existing SQLite"
-            )
-            detection_warnings.append(WarningRecord("detect_reports", message))
-            progress.warning(message)
+        if args.resume:
+            started = progress.begin("Detect supported reports")
             supported = None
+            progress.finish(
+                "Detect supported reports",
+                started,
+                "REUSED",
+                detail="resume mode probes only missing CSV reports",
+            )
+        else:
+            try:
+                supported = detect_supported_reports(
+                    args.nsys, output_dir, progress, warnings=detection_warnings
+                )
+            except CoreReportError as exc:
+                message = (
+                    f"{exc}; falling back to direct report probes against the existing SQLite"
+                )
+                detection_warnings.append(WarningRecord("detect_reports", message))
+                progress.warning(message)
+                supported = None
         collection = collect_reports(
             sqlite_path,
             selected,
@@ -293,19 +319,43 @@ def main(argv: Optional[List[str]] = None) -> int:
             output_dir,
             progress,
             allow_core_fallback=True,
+            reuse_existing=args.reuse_existing_stats or args.resume,
         )
         collection.warnings.extend(detection_warnings)
 
         started = progress.begin("Inspect SQLite event schema", input_path=sqlite_path)
-        extraction = load_kernel_events(sqlite_path)
+        request_event_enrichment = bool(
+            args.analyze_dependencies
+            or args.analyze_communication
+            or args.analyze_nvtx_attribution
+        )
+        extraction = load_kernel_events(
+            sqlite_path,
+            include_cuda_api=request_event_enrichment,
+            include_nvtx=request_event_enrichment,
+            attribute_nvtx=request_event_enrichment,
+        )
+        base_stats_status = (
+            "REUSED"
+            if collection.successful
+            and all(
+                collection.selected_sources.get(name) == "existing CSV"
+                for name in collection.successful
+            )
+            else "PASS"
+        )
+        extraction = replace(extraction, base_stats_status=base_stats_status)
         write_event_artifacts(extraction, output_dir)
         for message in extraction.missing_capabilities:
+            collection.warnings.append(WarningRecord("sqlite_events", message))
+            progress.warning(message)
+        for message in extraction.warnings:
             collection.warnings.append(WarningRecord("sqlite_events", message))
             progress.warning(message)
         progress.finish(
             "Inspect SQLite event schema",
             started,
-            "WARNING" if extraction.missing_capabilities else "SUCCESS",
+            "WARNING" if extraction.missing_capabilities or extraction.warnings else "SUCCESS",
             output_path=output_dir / "sqlite_schema.json",
         )
         if "cuda_gpu_kern_sum" not in collection.successful:
@@ -377,6 +427,25 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "WARNING",
                 detail=warning.message,
             )
+
+        dependency_status = (
+            "PASS" if args.analyze_dependencies and events else
+            "FAILED" if args.analyze_dependencies else "NOT_REQUESTED"
+        )
+        communication_status = (
+            "PASS" if args.analyze_communication and events else
+            "FAILED" if args.analyze_communication else "NOT_REQUESTED"
+        )
+        overall_status = extraction.overall_status
+        if "FAILED" in (dependency_status, communication_status):
+            overall_status = "PARTIAL"
+        extraction = replace(
+            extraction,
+            dependency_analysis_status=dependency_status,
+            communication_analysis_status=communication_status,
+            overall_status=overall_status,
+        )
+        write_event_metadata(extraction, output_dir)
 
         memory_events = load_memory_events(sqlite_path)
         memory_time_ns = sum(row.end_ns - row.start_ns for row in memory_events)
@@ -467,6 +536,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             else "direct SQLite query" if extraction.events else None
         )
         metadata["sqlite_missing_capabilities"] = extraction.missing_capabilities
+        metadata["base_stats_status"] = extraction.base_stats_status
+        metadata["kernel_event_status"] = extraction.kernel_event_status
+        metadata["nvtx_load_status"] = extraction.nvtx_load_status
+        metadata["nvtx_attribution_status"] = extraction.nvtx_attribution_status
+        metadata["dependency_analysis_status"] = extraction.dependency_analysis_status
+        metadata["communication_analysis_status"] = extraction.communication_analysis_status
+        metadata["overall_status"] = extraction.overall_status
+        metadata["nvtx_load_stats"] = (
+            extraction.nvtx_stats.__dict__ if extraction.nvtx_stats else None
+        )
+        metadata["event_extraction_warnings"] = extraction.warnings
+        metadata["nvtx_attribution_query_count"] = extraction.attribution_query_count
+        metadata["nvtx_attribution_candidate_checks"] = extraction.attribution_candidate_checks
         metadata["raw_report_integrity"] = integrity_result.raw_report_integrity
         metadata["analysis_completeness"] = integrity_result.analysis_completeness
         metadata["raw_integrity_reasons"] = list(integrity_result.raw_reasons)

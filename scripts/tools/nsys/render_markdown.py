@@ -91,6 +91,47 @@ def _native(data: AnalysisData, report: str, top: int) -> str:
     return _mapping_table(data.native_tables.get(report, []), top)
 
 
+def _nvtx_diagnostics(metadata: Mapping[str, object]) -> str:
+    stats = metadata.get("nvtx_load_stats")
+    if not isinstance(stats, dict):
+        return (
+            "NVTX detail loading was not requested; the default Top-kernel analysis "
+            "does not scan `NVTX_EVENTS`."
+        )
+    counts = stats.get("counts_by_event_type") or {}
+    skipped = stats.get("skipped_by_event_type") or {}
+    event_rows = [
+        {
+            "eventType": event_type,
+            "Rows": count,
+            "Skipped non-interval": skipped.get(event_type, skipped.get(str(event_type), 0)),
+        }
+        for event_type, count in counts.items()
+    ]
+    return "\n\n".join(
+        (
+            "### NVTX Diagnostics",
+            "\n".join(
+                (
+                    f"- Load status: `{_escape(metadata.get('nvtx_load_status'))}`",
+                    f"- Closed ranges loaded: `{_escape(stats.get('valid_closed_ranges'))}`",
+                    f"- NULL start rows skipped: `{_escape(stats.get('null_start_rows'))}`",
+                    f"- NULL end rows skipped: `{_escape(stats.get('null_end_rows'))}`",
+                    f"- Reversed intervals skipped: `{_escape(stats.get('invalid_interval_rows'))}`",
+                    f"- Load time: `{_escape(stats.get('load_duration_seconds'))}` seconds",
+                    f"- Estimated range memory: `{format_bytes(stats.get('estimated_memory_bytes'))}`",
+                )
+            ),
+            (
+                "Rows without a closed end timestamp are excluded from interval attribution. "
+                "No end timestamp is synthesized; eventType values are reported diagnostically "
+                "and are not assigned universal semantics."
+            ),
+            _mapping_table(event_rows, len(event_rows)) if event_rows else "Event-type counts: N/A",
+        )
+    )
+
+
 def render_markdown(
     data: AnalysisData, top: int = 20, output_path: Optional[Path] = None
 ) -> str:
@@ -172,7 +213,11 @@ def render_markdown(
         SECTION_TITLES[8],
         f"CUDA API Top:\n\n{_native(data, 'cuda_api_sum', top)}\n\nCUDA launch/API/queue/kernel time:\n\n{_native(data, 'cuda_kern_exec_sum', top)}",
         SECTION_TITLES[9],
-        f"NVTX range summary:\n\n{_native(data, 'nvtx_sum', top)}\n\nNVTX GPU projection:\n\n{_native(data, 'nvtx_gpu_proj_sum', top)}",
+        (
+            f"NVTX range summary:\n\n{_native(data, 'nvtx_sum', top)}\n\n"
+            f"NVTX GPU projection:\n\n{_native(data, 'nvtx_gpu_proj_sum', top)}\n\n"
+            f"{_nvtx_diagnostics(metadata)}"
+        ),
         SECTION_TITLES[10],
         f"Communication events:\n\n{_mapping_table(communication_rows, top)}\n\nGPU memory operation time:\n\n{_native(data, 'cuda_gpu_mem_time_sum', top)}\n\nGPU memory operation size:\n\n{_native(data, 'cuda_gpu_mem_size_sum', top)}",
         SECTION_TITLES[11],

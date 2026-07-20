@@ -75,6 +75,11 @@ class KernelEvent:
     thread_id: Optional[int] = None
     correlation_id: Optional[int] = None
     nvtx_range: str = "N/A"
+    nvtx_attribution_source: str = "UNATTRIBUTED"
+    nvtx_attribution_confidence: str = "NONE"
+    nvtx_attribution_reason: str = "NVTX attribution was not requested"
+    launch_api_name: str = "N/A"
+    launch_api_start_ns: Optional[int] = None
     classification_rule: str = "N/A"
     classification_confidence: str = "LOW"
     source_table: str = "N/A"
