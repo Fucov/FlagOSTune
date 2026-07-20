@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Supervise phase-selective SGLang Nsight Systems server captures."""
+"""Capture one complete measured SGLang inference window with Nsight Systems."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -57,50 +56,9 @@ def prepare_capture_outputs(log_paths: Sequence[Path], metadata_path: Path) -> N
         path.write_text("", encoding="utf-8")
 
 
-def profile_request_body(num_steps: int) -> dict:
-    """Build the SGLang scheduler-step profiler request.
-
-    Phase selection is performed by deciding when to send the request.  The
-    endpoint therefore receives a relative start step of zero, while the
-    requested scheduler-step count controls automatic profiler termination.
-    """
-    if num_steps <= 0:
-        raise ValueError("num_steps must be positive")
-    return {
-        "start_step": 0,
-        "num_steps": num_steps,
-        "activities": ["CUDA_PROFILER"],
-    }
-
-
-class DecodeDetector:
-    """Require both a decode marker and a positive running-request count."""
-
-    _decode = re.compile(r"\bDecode batch\b", re.IGNORECASE)
-    _running = re.compile(
-        r"running(?:[_\s]+(?:reqs?|request(?:\(s\)|s)?))?[^0-9]{0,20}([0-9]+)",
-        re.IGNORECASE,
-    )
-
-    def __init__(self) -> None:
-        self.decode_line: Optional[str] = None
-        self.running_line: Optional[str] = None
-
-    def feed(self, line: str) -> bool:
-        if self._decode.search(line):
-            self.decode_line = line.strip()
-        match = self._running.search(line)
-        if match and int(match.group(1)) > 0:
-            self.running_line = line.strip()
-        return self.decode_line is not None and self.running_line is not None
-
-    @property
-    def evidence(self) -> str:
-        values = []
-        for value in (self.decode_line, self.running_line):
-            if value and value not in values:
-                values.append(value)
-        return " | ".join(values)
+def profile_request_body() -> dict:
+    """Keep CUDA profiling active until the measured workload completes."""
+    return {"activities": ["CUDA_PROFILER"]}
 
 
 def _default_health_request(url: str, timeout: float) -> int:
@@ -137,82 +95,6 @@ def wait_ready(
     )
 
 
-def wait_for_decode(
-    log_path: Path,
-    timeout: float,
-    child_alive: Callable[[], None],
-    *,
-    poll_interval: float = 0.2,
-    start_offset: int = 0,
-) -> str:
-    """Incrementally monitor the server log for stable decode evidence."""
-    detector = DecodeDetector()
-    deadline = time.monotonic() + timeout
-    offset = start_offset
-    remainder = ""
-    while time.monotonic() < deadline:
-        if log_path.is_file():
-            with log_path.open(encoding="utf-8", errors="replace") as handle:
-                handle.seek(offset)
-                chunk = handle.read()
-                offset = handle.tell()
-            if chunk:
-                combined = remainder + chunk
-                lines = combined.splitlines(keepends=True)
-                remainder = ""
-                if lines and not lines[-1].endswith(("\n", "\r")):
-                    remainder = lines.pop()
-                for line in lines:
-                    if detector.feed(line):
-                        return detector.evidence
-                if remainder and detector.feed(remainder):
-                    return detector.evidence
-        child_alive()
-        time.sleep(poll_interval)
-    raise CaptureError(
-        f"decode evidence timeout after {timeout:g}s; no stable Decode batch "
-        "with positive running requests was observed"
-    )
-
-
-def wait_for_profile_completion(
-    log_path: Path,
-    start_offset: int,
-    timeout: float,
-    child_alive: Callable[[], None],
-    *,
-    poll_interval: float = 0.2,
-) -> str:
-    """Wait for SGLang's automatic num_steps profiler stop evidence."""
-    completed = re.compile(r"\bProfiling done\b", re.IGNORECASE)
-    deadline = time.monotonic() + timeout
-    offset = start_offset
-    remainder = ""
-    while time.monotonic() < deadline:
-        if log_path.is_file():
-            with log_path.open(encoding="utf-8", errors="replace") as handle:
-                handle.seek(offset)
-                chunk = handle.read()
-                offset = handle.tell()
-            if chunk:
-                combined = remainder + chunk
-                lines = combined.splitlines(keepends=True)
-                remainder = ""
-                if lines and not lines[-1].endswith(("\n", "\r")):
-                    remainder = lines.pop()
-                for line in lines:
-                    if completed.search(line):
-                        return line.strip()
-                if remainder and completed.search(remainder):
-                    return remainder.strip()
-        child_alive()
-        time.sleep(poll_interval)
-    raise CaptureError(
-        f"profile completion timeout after {timeout:g}s; SGLang did not log "
-        "automatic 'Profiling done' evidence for the requested num_steps"
-    )
-
-
 def http_json(
     method: str, url: str, body: Optional[Mapping[str, object]], timeout: float
 ) -> Tuple[int, object]:
@@ -241,8 +123,8 @@ def http_json(
         raise CaptureError(f"HTTP request failed: {method} {url}: {exc}") from exc
 
 
-def start_profile(base_url: str, num_steps: int, timeout: float = 10.0) -> dict:
-    body = profile_request_body(num_steps)
+def start_profile(base_url: str, timeout: float = 10.0) -> dict:
+    body = profile_request_body()
     status, response = http_json(
         "POST", base_url.rstrip("/") + "/start_profile", body, timeout
     )
@@ -255,6 +137,19 @@ def start_profile(base_url: str, num_steps: int, timeout: float = 10.0) -> dict:
     ):
         raise CaptureError(f"/start_profile rejected request: {response!r}")
     return {"request": body, "status": status, "response": response}
+
+
+def flush_cache(base_url: str, timeout: float = 30.0) -> dict:
+    status, response = http_json(
+        "POST", base_url.rstrip("/") + "/flush_cache", None, timeout
+    )
+    if not 200 <= status < 300:
+        raise CaptureError(f"/flush_cache returned HTTP {status}: {response!r}")
+    if isinstance(response, Mapping) and (
+        response.get("error") or response.get("success") is False
+    ):
+        raise CaptureError(f"/flush_cache rejected request: {response!r}")
+    return {"status": status, "response": response}
 
 
 def stop_profile(base_url: str, timeout: float = 10.0) -> dict:
@@ -297,14 +192,13 @@ def terminate_process_group(
 
 GROUP_MARKERS = {
     "--nsys-command": "nsys",
-    "--warmup-command": "warmup",
     "--benchmark-command": "benchmark",
 }
 
 
 def parse_command_groups(argv: Sequence[str]) -> Tuple[List[str], Dict[str, List[str]]]:
     prefix: List[str] = []
-    groups: Dict[str, List[str]] = {"nsys": [], "warmup": [], "benchmark": []}
+    groups: Dict[str, List[str]] = {"nsys": [], "benchmark": []}
     current: Optional[str] = None
     for token in argv:
         marker = GROUP_MARKERS.get(token)
@@ -363,37 +257,49 @@ def _atomic_json(path: Path, value: Mapping[str, object]) -> None:
     os.replace(temporary, path)
 
 
-def _run_logged(command: Sequence[str], log_path: Path, label: str) -> None:
+def _run_logged(
+    command: Sequence[str],
+    log_path: Path,
+    label: str,
+    *,
+    child_alive: Optional[Callable[[], None]] = None,
+    timeout: Optional[float] = None,
+) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    process: Optional[subprocess.Popen] = None
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write(f"[{label}] {json.dumps(list(command), ensure_ascii=False)}\n")
         handle.flush()
-        result = subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT)
-    if result.returncode != 0:
-        raise CaptureError(f"{label} command failed with exit {result.returncode}")
+        process = subprocess.Popen(
+            command,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        try:
+            while True:
+                code = process.poll()
+                if code is not None:
+                    if code != 0:
+                        raise CaptureError(
+                            f"{label} command failed with exit {code}"
+                        )
+                    return
+                if child_alive is not None:
+                    child_alive()
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise CaptureError(f"{label} timeout after {timeout:g}s")
+                time.sleep(0.2)
+        finally:
+            if process.poll() is None:
+                terminate_process_group(process, grace_seconds=2.0)
 
 
 def _child_alive(process: subprocess.Popen, label: str) -> None:
     code = process.poll()
     if code is not None:
         raise CaptureError(f"{label} exited unexpectedly with code {code}")
-
-
-def _wait_benchmark(
-    benchmark: subprocess.Popen,
-    nsys_process: subprocess.Popen,
-    timeout: float,
-) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        code = benchmark.poll()
-        if code is not None:
-            if code != 0:
-                raise CaptureError(f"benchmark command failed with exit {code}")
-            return
-        _child_alive(nsys_process, "nsys/server")
-        time.sleep(0.2)
-    raise CaptureError(f"benchmark timeout after {timeout:g}s")
 
 
 def _parse_throughput(path: Path) -> Optional[float]:
@@ -405,9 +311,9 @@ def _parse_throughput(path: Path) -> Optional[float]:
         r"([0-9]+(?:\.[0-9]+)?)\s*requests/s",
     )
     for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return float(match.group(1))
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        if matches:
+            return float(matches[-1])
     return None
 
 
@@ -422,12 +328,10 @@ def run_capture(args: argparse.Namespace, commands: Mapping[str, Sequence[str]])
     prepare_capture_outputs((server_log, nsys_log, benchmark_log), metadata_path)
 
     nsys_process: Optional[subprocess.Popen] = None
-    benchmark_process: Optional[subprocess.Popen] = None
     ready_endpoint: Optional[str] = None
-    phase_evidence = ""
-    profile_completion_evidence = ""
-    profile_log_offset = 0
+    cache_flush_exchange: Optional[dict] = None
     profile_exchange: Optional[dict] = None
+    stop_exchange: Optional[dict] = None
     capture_start_iso: Optional[str] = None
     capture_start_monotonic: Optional[float] = None
     capture_end_iso: Optional[str] = None
@@ -452,99 +356,34 @@ def run_capture(args: argparse.Namespace, commands: Mapping[str, Sequence[str]])
             ready_endpoint = wait_ready(
                 args.base_url, args.profile_ready_timeout, alive
             )
-
-            if args.profile_phase == "startup":
-                profile_log_offset = server_log.stat().st_size if server_log.is_file() else 0
-                capture_start_iso = now_iso()
-                capture_start_monotonic = time.monotonic()
-                profile_exchange = start_profile(
-                    args.base_url, args.profile_num_steps
-                )
-                phase_evidence = (
-                    "profile started after HTTP readiness and before workload warmup; "
-                    "this is post-load startup/warmup evidence, not model-load capture"
+            workload_timeout = max(args.profile_ready_timeout, 60.0) * 4
+            for run_number in range(1, args.total_runs):
+                _run_logged(
+                    commands["benchmark"],
+                    benchmark_log,
+                    f"warmup-{run_number}",
+                    child_alive=alive,
+                    timeout=workload_timeout,
                 )
 
-            _run_logged(commands["warmup"], benchmark_log, "warmup")
-
-            if args.profile_phase == "startup":
-                profile_completion_evidence = wait_for_profile_completion(
-                    server_log,
-                    profile_log_offset,
-                    args.profile_ready_timeout,
-                    alive,
-                )
-                capture_end_iso = now_iso()
-                capture_end_monotonic = time.monotonic()
-
-            if args.profile_phase in ("prefill", "full"):
-                profile_log_offset = server_log.stat().st_size if server_log.is_file() else 0
-                capture_start_iso = now_iso()
-                capture_start_monotonic = time.monotonic()
-                profile_exchange = start_profile(
-                    args.base_url, args.profile_num_steps
-                )
-                phase_evidence = (
-                    "profile started before measured benchmark "
-                    f"for requested {args.profile_phase} phase via {ready_endpoint}"
-                )
-
+            cache_flush_exchange = flush_cache(args.base_url)
+            capture_start_iso = now_iso()
+            capture_start_monotonic = time.monotonic()
+            profile_exchange = start_profile(args.base_url)
             benchmark_start_iso = now_iso()
             benchmark_start_monotonic = time.monotonic()
-            measured_log_offset = server_log.stat().st_size if server_log.is_file() else 0
-            with benchmark_log.open("a", encoding="utf-8") as benchmark_handle:
-                benchmark_handle.write(
-                    "[benchmark] "
-                    + json.dumps(list(commands["benchmark"]), ensure_ascii=False)
-                    + "\n"
-                )
-                benchmark_handle.flush()
-                benchmark_process = subprocess.Popen(
-                    commands["benchmark"],
-                    stdout=benchmark_handle,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-                if args.profile_phase == "decode":
-                    phase_evidence = wait_for_decode(
-                        server_log,
-                        args.profile_ready_timeout,
-                        lambda: (
-                            _child_alive(nsys_process, "nsys/server"),
-                            _child_alive(benchmark_process, "benchmark"),
-                        ),
-                        start_offset=measured_log_offset,
-                    )
-                    profile_log_offset = server_log.stat().st_size if server_log.is_file() else 0
-                    capture_start_iso = now_iso()
-                    capture_start_monotonic = time.monotonic()
-                    profile_exchange = start_profile(
-                        args.base_url, args.profile_num_steps
-                    )
-                if args.profile_phase != "startup":
-                    profile_completion_evidence = wait_for_profile_completion(
-                        server_log,
-                        profile_log_offset,
-                        args.profile_ready_timeout,
-                        lambda: (
-                            _child_alive(nsys_process, "nsys/server"),
-                            _child_alive(benchmark_process, "benchmark"),
-                        ),
-                    )
-                    capture_end_iso = now_iso()
-                    capture_end_monotonic = time.monotonic()
-                _wait_benchmark(
-                    benchmark_process,
-                    nsys_process,
-                    max(args.profile_ready_timeout, 60.0) * 4,
-                )
+            _run_logged(
+                commands["benchmark"],
+                benchmark_log,
+                f"benchmark-{args.total_runs}",
+                child_alive=alive,
+                timeout=workload_timeout,
+            )
             benchmark_end_iso = now_iso()
             benchmark_end_monotonic = time.monotonic()
-            benchmark_process = None
-            # num_steps makes SGLang call cudaProfilerStop automatically.  Do
-            # not issue /stop_profile here: doing so would turn a selective
-            # capture into a benchmark-duration capture and may race the
-            # scheduler's automatic stop.
+            stop_exchange = stop_profile(args.base_url)
+            capture_end_iso = now_iso()
+            capture_end_monotonic = time.monotonic()
             terminate_process_group(nsys_process, grace_seconds=15.0)
             nsys_process = None
 
@@ -560,23 +399,18 @@ def run_capture(args: argparse.Namespace, commands: Mapping[str, Sequence[str]])
             "capture_status": "PASS",
             "input_report": str(report),
             "report_size": report.stat().st_size,
-            "capture_mode": "server-steps",
-            "capture_scope": "scheduler_steps",
-            "inference_scope": "phase_selective_scheduler_steps",
-            "steady_state_guaranteed": args.profile_phase in ("prefill", "decode"),
-            "requested_phase": args.profile_phase,
-            "profile_phase": args.profile_phase,
-            "detected_phase": args.profile_phase.upper(),
-            "phase_confidence": "HIGH" if args.profile_phase == "decode" else "MEDIUM",
-            "phase_evidence": phase_evidence,
-            "profile_completion_evidence": profile_completion_evidence,
-            "capture_end_source": "server_log_automatic_profile_stop",
-            "profile_start_step": args.profile_start_step,
-            "effective_profile_start_step": 0,
-            "profile_num_steps": args.profile_num_steps,
-            "profile_warmup_prompts": args.profile_warmup_prompts,
+            "capture_mode": "server-full",
+            "capture_scope": "measured_inference",
+            "inference_scope": "prefill_and_decode",
+            "steady_state_guaranteed": args.total_runs > 1,
+            "total_runs": args.total_runs,
+            "warmup_runs": args.total_runs - 1,
+            "captured_run": args.total_runs,
+            "capture_end_source": "stop_profile_after_measured_benchmark",
             "profile_ready_timeout_seconds": args.profile_ready_timeout,
+            "cache_flush_response": cache_flush_exchange,
             "profile_request": profile_exchange,
+            "profile_stop_response": stop_exchange,
             "readiness_endpoint": ready_endpoint,
             "capture_start_wall_time": capture_start_iso,
             "capture_end_wall_time": capture_end_iso,
@@ -600,7 +434,7 @@ def run_capture(args: argparse.Namespace, commands: Mapping[str, Sequence[str]])
             "num_prompts": args.num_prompts,
             "input_tokens": args.input_tokens,
             "output_tokens": args.output_tokens,
-            "concurrency": args.profile_concurrency,
+            "concurrency": args.concurrency,
             "tp_size": args.tp_size,
             "benchmark_throughput": _parse_throughput(benchmark_log),
             "benchmark_status": "PASS",
@@ -616,7 +450,6 @@ def run_capture(args: argparse.Namespace, commands: Mapping[str, Sequence[str]])
             "nsys_log": str(nsys_log),
             "benchmark_log": str(benchmark_log),
             "nsys_command": list(commands["nsys"]),
-            "warmup_command": list(commands["warmup"]),
             "benchmark_command": list(commands["benchmark"]),
             "generated_time": now_iso(),
         }
@@ -630,8 +463,15 @@ def run_capture(args: argparse.Namespace, commands: Mapping[str, Sequence[str]])
         _atomic_json(metadata_path, metadata)
         return metadata
     finally:
-        if benchmark_process is not None:
-            terminate_process_group(benchmark_process, grace_seconds=2.0)
+        if (
+            profile_exchange is not None
+            and stop_exchange is None
+            and nsys_process is not None
+        ):
+            try:
+                stop_profile(args.base_url)
+            except CaptureError:
+                pass
         if nsys_process is not None:
             terminate_process_group(nsys_process, grace_seconds=5.0)
 
@@ -643,8 +483,22 @@ def _bool(value: str) -> bool:
     return lowered == "true"
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("expected a positive number")
+    return parsed
+
+
 def build_run_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="sglang_server_steps.py run")
+    parser = argparse.ArgumentParser(prog="sglang_server_capture.py run")
     parser.add_argument("--output-prefix", required=True)
     parser.add_argument("--report", required=True)
     parser.add_argument("--metadata", required=True)
@@ -652,15 +506,17 @@ def build_run_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nsys-log", required=True)
     parser.add_argument("--benchmark-log", required=True)
     parser.add_argument("--base-url", required=True)
-    parser.add_argument("--profile-phase", choices=("startup", "prefill", "decode", "full"), required=True)
-    parser.add_argument("--profile-start-step", type=int, default=0)
-    parser.add_argument("--profile-num-steps", type=int, required=True)
-    parser.add_argument("--profile-warmup-prompts", type=int, required=True)
-    parser.add_argument("--profile-concurrency", type=int, required=True)
-    parser.add_argument("--profile-ready-timeout", type=float, required=True)
-    parser.add_argument("--decode-log-pattern")
+    parser.add_argument("--total-runs", type=_positive_int, required=True)
+    parser.add_argument("--concurrency", type=_positive_int, required=True)
+    parser.add_argument(
+        "--profile-ready-timeout", type=_positive_float, required=True
+    )
     parser.add_argument("--cuda-graph-enabled", type=_bool, required=True)
-    parser.add_argument("--cuda-graph-trace", choices=("graph", "node", "none"), required=True)
+    parser.add_argument(
+        "--cuda-graph-trace",
+        choices=("graph", "node", "none"),
+        required=True,
+    )
     parser.add_argument("--layerwise-nvtx-enabled", type=_bool, required=True)
     parser.add_argument("--project-root", required=True)
     parser.add_argument("--workflow-script", required=True)
@@ -678,7 +534,7 @@ def build_run_parser() -> argparse.ArgumentParser:
 
 
 def exec_server(argv: Sequence[str]) -> int:
-    parser = argparse.ArgumentParser(prog="sglang_server_steps.py exec-server")
+    parser = argparse.ArgumentParser(prog="sglang_server_capture.py exec-server")
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
