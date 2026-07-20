@@ -42,14 +42,17 @@ benchmark workload repeatedly according to `benchmark.num_runs`:
 
 1. Runs `1..num_runs-1` execute outside the capture range and warm the exact
    configured shapes and concurrency.
-2. Immediately before the final run, the supervisor posts `/start_profile`
+2. After the warmup runs finish and the server is idle, the supervisor posts
+   `/flush_cache`. This preserves compiled/JIT kernels and allocator warmup but
+   prevents the measured prompts from reusing warmup KV/prefix cache entries.
+3. Immediately before the final run, the supervisor posts `/start_profile`
    with only `activities: [CUDA_PROFILER]`. It deliberately omits `start_step`
    and `num_steps`.
-3. The final run uses the scenario's `num_prompts` (falling back to
+4. The final run uses the scenario's `num_prompts` (falling back to
    `concurrency`) and `max-concurrency`. This entire run is the measured window.
-4. After every measured request finishes, the supervisor posts
+5. After every measured request finishes, the supervisor posts
    `/stop_profile`.
-5. The owned Nsight/server process group is terminated gracefully so Nsight can
+6. The owned Nsight/server process group is terminated gracefully so Nsight can
    finalize a non-empty `.nsys-rep`.
 
 For both acceptance configs, `benchmark.num_runs` is `2`: run 1 is the
@@ -89,7 +92,7 @@ non-empty. The metadata records at least:
 - `total_runs`, `warmup_runs`, and `captured_run`;
 - input tokens, output tokens, request count, max concurrency, and TP size;
 - benchmark and capture timestamps/durations;
-- start/stop endpoint exchanges and readiness endpoint;
+- cache-flush/start/stop endpoint exchanges and readiness endpoint;
 - report size, commands, logs, visible GPUs, git state, script hashes, Nsight
   version, CUDA graph state, layerwise NVTX state, and detected JIT/fallback
   warnings.
@@ -123,8 +126,9 @@ prefill and decode captures.
 The supervisor must preserve separate server, Nsight, and benchmark logs. Error
 messages identify the failing lifecycle stage and point to the relevant log.
 HTTP non-2xx responses and JSON responses containing `error` or
-`success: false` are fatal. Cleanup stops any owned benchmark and server/Nsight
-process groups without killing unrelated processes.
+`success: false` from cache-flush/profile control endpoints are fatal. Cleanup
+stops any owned benchmark and server/Nsight process groups without killing
+unrelated processes.
 
 ## Verification
 
@@ -137,6 +141,7 @@ Tests are written before implementation and cover:
   2;
 - `/start_profile` omitting step fields and `/stop_profile` occurring only
   after the measured benchmark succeeds;
+- `/flush_cache` occurring after the last warmup and before `/start_profile`;
 - HTTP rejection, child exit, benchmark failure, timeout, cleanup, stale
   metadata, and empty-report failures;
 - direct absolute-path execution of `sglang_server_capture.py` without relying
